@@ -1,31 +1,18 @@
 # brew-proxy
 
-Zentraler API-Proxy (Node.js/Express) für das Brewing-Ecosystem. Verwaltet alle externen API-Calls sicher auf dem Server – kein API-Key gelangt je in den Browser.
+Zentraler API-Proxy für das Brewing-Ökosystem.
 
-## Verantwortlichkeiten
-- RAPT API Polling (Sensordaten holen & cachen)
-- OpenAI API (Rezeptgenerator für brew_assistent)
-- Authentifizierung & Rate-Limiting
+- OpenAI-Proxy (hält den API-Key serverseitig, Frontend kann ohne Secret rufen)
+- RAPT.io API-Proxy mit Token-Refresh und Telemetrie-Cache
+- Brewing-Shop Crawler (Playwright + Chromium)
 
-## Architektur
-- Container: `api_proxy`
-- Port intern: `3000`
-- Deployment: GitOps via Watchtower
-- Kein direkter Inbound-Port – nur intern im Docker-Netzwerk erreichbar
-
-## Lokale Entwicklung
+## Lokal
 ```bash
+cp .env.example .env   # Keys eintragen
 npm install
-npm run dev
+npm start              # läuft auf :3000
 ```
 
-## Umgebungsvariablen (.env)
-```
-RAPT_EMAIL=deine@email.ch
-RAPT_PASSWORD=deinPasswort
-OPENAI_API_KEY=sk-...
-PORT=3000
-```
-
-## Deployment
-Push auf `main` → GitHub Actions → Docker Hub → Watchtower deployed automatisch.
+## Container
+Image: `<DOCKERHUB_USERNAME>/brew_proxy:latest`
+Build: GitHub Actions on push to `main`.
