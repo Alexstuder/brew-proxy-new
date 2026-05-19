@@ -145,8 +145,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const dbSync = require('./db-sync');
+
 server.listen(PORT, () => {
   console.log(`Proxy listening on http://localhost:${PORT}`);
+  dbSync.init();   // Periodic sync RAPT API → Postgres (rapt.* schema)
   const initialForce = !telemetryCache;
   ensureTelemetryCache({
     force: initialForce,
