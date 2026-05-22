@@ -307,39 +307,41 @@ async function handleGenerateImageRequest(req, res) {
       return;
     }
 
-    // --- Step 2: Generate Image with DALL-E 3 ---
-    const dallEResponse = await fetch('https://api.openai.com/v1/images/generations', {
+    // --- Step 2: Generate Image with gpt-image-1 ---
+    // Liefert immer base64 (kein url-Mode). Wir verpacken in eine data: URI,
+    // damit die Flutter-Seite das wie vorher als "URL" weiterverarbeiten kann.
+    const imageResponse = await fetch('https://api.openai.com/v1/images/generations', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'dall-e-3',
+        model: 'gpt-image-1',
         prompt: refinedPrompt,
         n: 1,
         size: '1024x1024',
-        quality: 'standard',
+        quality: 'medium',
       }),
     });
 
-    const dallEPayload = await dallEResponse.json();
+    const imagePayload = await imageResponse.json();
 
-    if (!dallEResponse.ok) {
-      console.error('DALL-E API error:', dallEResponse.status, dallEPayload);
-      respondJson(res, dallEResponse.status, {
-        error: dallEPayload?.error?.message || 'DALL-E generation failed.',
+    if (!imageResponse.ok) {
+      console.error('Image API error:', imageResponse.status, imagePayload);
+      respondJson(res, imageResponse.status, {
+        error: imagePayload?.error?.message || 'Bildgenerierung fehlgeschlagen.',
       });
       return;
     }
 
-    const imageUrl = dallEPayload.data?.[0]?.url;
-    if (!imageUrl) {
-      respondJson(res, 502, { error: 'Kein Bild-URL von DALL-E erhalten.' });
+    const b64 = imagePayload.data?.[0]?.b64_json;
+    if (!b64) {
+      respondJson(res, 502, { error: 'Kein Bild von gpt-image-1 erhalten.' });
       return;
     }
 
-    respondJson(res, 200, { result: imageUrl });
+    respondJson(res, 200, { result: `data:image/png;base64,${b64}` });
   } catch (error) {
     console.error('Proxy error:', error);
     respondJson(res, 500, { error: 'Interner Proxy-Fehler.' });
