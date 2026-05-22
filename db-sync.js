@@ -270,29 +270,60 @@ async function syncHydrometerTelemetry(token, hydrometerId) {
 }
 
 async function deriveBrewSessions() {
-  // Aggregiert pro RAPT-profile_id aus telemetry_controllers.
-  // is_manual=true Rows werden NICHT angetasst (User-Hand-Edits geschützt).
-  // Custom-Dates ebenfalls nicht überschrieben.
-  await pool.query(`
-    INSERT INTO rapt.brew_sessions (profile_id, name, start_date, end_date, is_manual, updated_at)
-    SELECT
-      t.profile_id,
-      COALESCE(p.name, '(unbenannter Sud)'),
-      MIN(t.created_on),
-      MAX(t.created_on),
-      false,
-      now()
-    FROM rapt.telemetry_controllers t
-    LEFT JOIN rapt.profiles p ON p.id = t.profile_id
-    WHERE t.profile_id IS NOT NULL
-    GROUP BY t.profile_id, p.name
-    ON CONFLICT (profile_id) DO UPDATE SET
-      start_date = EXCLUDED.start_date,
-      end_date   = EXCLUDED.end_date,
-      name       = COALESCE(rapt.brew_sessions.name, EXCLUDED.name),
-      updated_at = now()
-    WHERE rapt.brew_sessions.is_manual = false;
+  // Telemetrie per profile_id split bei Lücken >7 Tage → mehrere Sessions pro Profile.
+  // Match auf existierende brew_sessions per (profile_id, start_date ±1 Tag).
+  // is_manual=true und custom_*_date werden NIE angefasst.
+  const detected = await pool.query(`
+    WITH ordered AS (
+      SELECT created_on, profile_id,
+             LAG(created_on) OVER (PARTITION BY profile_id ORDER BY created_on) AS prev
+      FROM rapt.telemetry_controllers
+      WHERE profile_id IS NOT NULL
+    ),
+    marked AS (
+      SELECT created_on, profile_id,
+        SUM(CASE WHEN prev IS NULL OR created_on - prev > INTERVAL '7 days' THEN 1 ELSE 0 END)
+          OVER (PARTITION BY profile_id ORDER BY created_on) AS sess_n
+      FROM ordered
+    )
+    SELECT profile_id, sess_n AS session_index,
+           MIN(created_on) AS first_seen,
+           MAX(created_on) AS last_seen
+    FROM marked
+    GROUP BY profile_id, sess_n
   `);
+
+  let inserted = 0, updated = 0;
+  for (const s of detected.rows) {
+    const match = await pool.query(
+      `SELECT id FROM rapt.brew_sessions
+       WHERE profile_id = $1
+         AND ABS(EXTRACT(EPOCH FROM (start_date - $2::timestamptz))) < 86400
+       LIMIT 1`,
+      [s.profile_id, s.first_seen]
+    );
+    if (match.rows.length > 0) {
+      const r = await pool.query(
+        `UPDATE rapt.brew_sessions
+         SET end_date = $1, updated_at = now()
+         WHERE id = $2 AND NOT is_manual AND end_date <> $1`,
+        [s.last_seen, match.rows[0].id]
+      );
+      updated += r.rowCount;
+    } else {
+      await pool.query(
+        `INSERT INTO rapt.brew_sessions (profile_id, name, start_date, end_date, is_manual)
+         VALUES ($1,
+                 COALESCE((SELECT name FROM rapt.profiles WHERE id = $1), '(unbenannter Sud)'),
+                 $2, $3, false)`,
+        [s.profile_id, s.first_seen, s.last_seen]
+      );
+      inserted++;
+    }
+  }
+  if (inserted + updated > 0) {
+    console.log(`[db-sync] brew_sessions: +${inserted} new, ${updated} updated`);
+  }
 }
 
 // ---------------------------------------------------------------------------
