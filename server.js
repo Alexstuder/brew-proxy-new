@@ -672,7 +672,7 @@ async function handleRaptTelemetryRequest(req, res) {
     const isLiveRequest = !effectiveStartOverride;
 
     if (isLiveRequest && !hasActiveSessionInCache()) {
-      const fallback = tryServeFallback();
+      const fallback = await tryServeFallback();
       if (fallback) {
         payloadData = fallback;
       }
@@ -711,7 +711,7 @@ async function handleTelemetryCacheResponse(res) {
 
   // Fallback Logic for Cache Endpoint
   if (!hasActiveSessionInCache()) {
-    const fallback = tryServeFallback();
+    const fallback = await tryServeFallback();
     if (fallback) {
       console.log('[Proxy] Using fallback for cache endpoint.');
       dataToSend = fallback;
@@ -725,7 +725,13 @@ async function handleTelemetryCacheResponse(res) {
   respondJson(res, 200, dataToSend);
 }
 
-function tryServeFallback() {
+async function tryServeFallback() {
+  const fromDisk = tryServeFallbackFromDisk();
+  if (fromDisk) return fromDisk;
+  return tryServeFallbackFromDb();
+}
+
+function tryServeFallbackFromDisk() {
   try {
     if (fs.existsSync(LAST_TELEMETRY_CACHE_FILE)) {
       const raw = fs.readFileSync(LAST_TELEMETRY_CACHE_FILE, 'utf8');
@@ -735,16 +741,78 @@ function tryServeFallback() {
       if (potentialPayload && Array.isArray(potentialPayload.rows) && potentialPayload.rows.length) {
         // Check if rows are actually valid (no error)
         if (!potentialPayload.rows[0].error) {
-          console.log(`[Proxy] Serving fallback with ${potentialPayload.rows.length} rows.`);
-          // Ensure isFallback flag
+          console.log(`[Proxy] Serving disk fallback with ${potentialPayload.rows.length} rows.`);
           return { ...potentialPayload, isFallback: true };
         }
       }
     }
   } catch (err) {
-    console.warn('[Proxy] Fallback read failed:', err.message);
+    console.warn('[Proxy] Disk fallback read failed:', err.message);
   }
   return null;
+}
+
+// Fallback aus rapt.* DB-Tabellen: liefert Hydrometer-Telemetrie des
+// letzten brew_session-Zeitfensters, gemappt auf die übliche row-Shape.
+async function tryServeFallbackFromDb() {
+  const pool = dbSync.getPool && dbSync.getPool();
+  if (!pool) return null;
+
+  try {
+    const sessionRes = await pool.query(`
+      SELECT bs.profile_id, bs.name, bs.start_date, bs.end_date
+      FROM rapt.brew_sessions bs
+      WHERE bs.start_date IS NOT NULL AND bs.end_date IS NOT NULL
+      ORDER BY bs.end_date DESC
+      LIMIT 1
+    `);
+    if (sessionRes.rows.length === 0) return null;
+    const session = sessionRes.rows[0];
+
+    const teleRes = await pool.query(`
+      SELECT h.hydrometer_id, h.created_on, h.temperature, h.gravity,
+             h.gravity_velocity, h.battery, h.mac_address
+      FROM rapt.telemetry_hydrometers h
+      WHERE h.created_on BETWEEN $1 AND $2
+      ORDER BY h.created_on ASC
+    `, [session.start_date, session.end_date]);
+
+    if (teleRes.rows.length === 0) return null;
+
+    const ctrlRes = await pool.query(`
+      SELECT DISTINCT device_id FROM rapt.telemetry_controllers
+      WHERE profile_id = $1 LIMIT 1
+    `, [session.profile_id]);
+    const controllerId = ctrlRes.rows[0]?.device_id || null;
+
+    const startIso = new Date(session.start_date).toISOString();
+    const rows = teleRes.rows.map(r => ({
+      controllerId,
+      hydrometerId: r.hydrometer_id,
+      startDate: startIso,
+      createdOn: new Date(r.created_on).toISOString(),
+      temperature: r.temperature,
+      gravity: r.gravity,
+      gravityVelocity: r.gravity_velocity,
+      battery: r.battery,
+      macAddress: r.mac_address,
+      profileName: session.name,
+    }));
+
+    console.log(`[Proxy] Serving DB fallback: session "${session.name}" with ${rows.length} rows.`);
+    return {
+      rows,
+      generatedAt: new Date().toISOString(),
+      startDate: startIso,
+      endDate: new Date(session.end_date).toISOString(),
+      profileName: session.name,
+      requestedStartDate: null,
+      isFallback: true,
+    };
+  } catch (err) {
+    console.warn('[Proxy] DB fallback failed:', err.message);
+    return null;
+  }
 }
 
 async function handleControllerCacheResponse(res) {

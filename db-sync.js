@@ -270,14 +270,17 @@ async function syncHydrometerTelemetry(token, hydrometerId) {
 }
 
 async function deriveBrewSessions() {
-  // Aggregiert pro profile_id aus telemetry_controllers. Custom dates bleiben unangetastet.
+  // Aggregiert pro RAPT-profile_id aus telemetry_controllers.
+  // is_manual=true Rows werden NICHT angetasst (User-Hand-Edits geschützt).
+  // Custom-Dates ebenfalls nicht überschrieben.
   await pool.query(`
-    INSERT INTO rapt.brew_sessions (profile_id, name, start_date, end_date, updated_at)
+    INSERT INTO rapt.brew_sessions (profile_id, name, start_date, end_date, is_manual, updated_at)
     SELECT
       t.profile_id,
       COALESCE(p.name, '(unbenannter Sud)'),
       MIN(t.created_on),
       MAX(t.created_on),
+      false,
       now()
     FROM rapt.telemetry_controllers t
     LEFT JOIN rapt.profiles p ON p.id = t.profile_id
@@ -287,7 +290,8 @@ async function deriveBrewSessions() {
       start_date = EXCLUDED.start_date,
       end_date   = EXCLUDED.end_date,
       name       = COALESCE(rapt.brew_sessions.name, EXCLUDED.name),
-      updated_at = now();
+      updated_at = now()
+    WHERE rapt.brew_sessions.is_manual = false;
   `);
 }
 
@@ -345,4 +349,8 @@ async function runSync() {
   }
 }
 
-module.exports = { init, runSync, ready };
+function getPool() {
+  return pool;
+}
+
+module.exports = { init, runSync, ready, getPool };
