@@ -10,17 +10,20 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const SYNC_INTERVAL_MS = Number(process.env.RAPT_SYNC_INTERVAL_MS ?? 5 * 60 * 1000);
 const SYNC_ENABLED = process.env.RAPT_SYNC_ENABLED !== 'false';
 
-const RAPT_USERNAME = process.env.RAPT_USERNAME;
-const RAPT_API_KEY = process.env.RAPT_API_KEY;
+// Fallback-Credentials aus Env (für Notfall / Initial-Bootstrap). Primär liest
+// db-sync die Credentials pro Sync-Lauf aus rapt.user_profiles, damit jeder
+// User später seine eigenen Keys verwalten kann (multi-user-ready).
+const ENV_FALLBACK_RAPT_USERNAME = process.env.RAPT_USERNAME;
+const ENV_FALLBACK_RAPT_API_KEY = process.env.RAPT_API_KEY;
 const RAPT_TOKEN_ENDPOINT = process.env.RAPT_TOKEN_ENDPOINT ?? 'https://id.rapt.io/connect/token';
 const RAPT_API_BASE = process.env.RAPT_API_BASE ?? 'https://api.rapt.io';
 
 let pool = null;
-let tokenCache = null;
-let tokenExpiry = 0;
+// Token-Cache pro RAPT-Username (für multi-user später)
+const tokenCacheByUser = new Map(); // username → {token, expiry}
 
 function ready() {
-  return Boolean(SYNC_ENABLED && DATABASE_URL && RAPT_USERNAME && RAPT_API_KEY);
+  return Boolean(SYNC_ENABLED && DATABASE_URL);
 }
 
 function init() {
@@ -41,15 +44,16 @@ function init() {
 // RAPT API access
 // ---------------------------------------------------------------------------
 
-async function getToken() {
+async function getToken(username, apiKey) {
   const now = Date.now();
-  if (tokenCache && tokenExpiry > now + 60000) return tokenCache;
+  const cached = tokenCacheByUser.get(username);
+  if (cached && cached.expiry > now + 60000) return cached.token;
 
   const body = new URLSearchParams({
     client_id: 'rapt-user',
     grant_type: 'password',
-    username: RAPT_USERNAME,
-    password: RAPT_API_KEY,
+    username,
+    password: apiKey,
   });
   const resp = await fetch(RAPT_TOKEN_ENDPOINT, {
     method: 'POST',
@@ -57,15 +61,16 @@ async function getToken() {
     body,
   });
   const data = await resp.json();
-  if (!resp.ok) throw new Error(`RAPT auth failed: ${data.error_description || resp.status}`);
+  if (!resp.ok) throw new Error(`RAPT auth failed for ${username}: ${data.error_description || resp.status}`);
 
-  tokenCache = data.access_token;
-  tokenExpiry = now + (data.expires_in || 3600) * 1000;
-  return tokenCache;
+  tokenCacheByUser.set(username, {
+    token: data.access_token,
+    expiry: now + (data.expires_in || 3600) * 1000,
+  });
+  return data.access_token;
 }
 
-async function raptGet(path, params = {}) {
-  const token = await getToken();
+async function raptGet(token, path, params = {}) {
   const url = new URL(path, RAPT_API_BASE);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, v);
@@ -73,6 +78,26 @@ async function raptGet(path, params = {}) {
   const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!resp.ok) throw new Error(`RAPT ${path} failed: ${resp.status}`);
   return resp.json();
+}
+
+/// Lädt alle User-Profile mit RAPT-Credentials. Bei multi-user gibt's
+/// mehrere Rows, jede mit eigenen Keys.
+async function fetchActiveProfiles() {
+  const res = await pool.query(`
+    SELECT id, rapt_user_id, rapt_api_key FROM rapt.user_profiles
+    WHERE rapt_user_id IS NOT NULL AND rapt_api_key IS NOT NULL
+  `);
+  if (res.rows.length > 0) return res.rows;
+  // Fallback auf Env wenn die Tabelle leer (für Erstmigration)
+  if (ENV_FALLBACK_RAPT_USERNAME && ENV_FALLBACK_RAPT_API_KEY) {
+    console.warn('[db-sync] no profiles in rapt.user_profiles, falling back to env vars');
+    return [{
+      id: 'env-fallback',
+      rapt_user_id: ENV_FALLBACK_RAPT_USERNAME,
+      rapt_api_key: ENV_FALLBACK_RAPT_API_KEY,
+    }];
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -204,13 +229,13 @@ async function lastTelemetryTs(table, idColumn, deviceId) {
   return res.rows[0]?.last || null;
 }
 
-async function syncControllerTelemetry(controllerId) {
+async function syncControllerTelemetry(token, controllerId) {
   const last = await lastTelemetryTs('rapt.telemetry_controllers', 'device_id', controllerId);
   const startDate = (last ? new Date(last.getTime() + 1000) : new Date('2010-01-01T00:00:00Z')).toISOString();
   const endDate = new Date().toISOString();
   let inserted = 0;
   try {
-    const data = await raptGet('/api/TemperatureControllers/GetTelemetry', {
+    const data = await raptGet(token, '/api/TemperatureControllers/GetTelemetry', {
       temperatureControllerId: controllerId,
       startDate,
       endDate,
@@ -224,13 +249,13 @@ async function syncControllerTelemetry(controllerId) {
   return inserted;
 }
 
-async function syncHydrometerTelemetry(hydrometerId) {
+async function syncHydrometerTelemetry(token, hydrometerId) {
   const last = await lastTelemetryTs('rapt.telemetry_hydrometers', 'hydrometer_id', hydrometerId);
   const startDate = (last ? new Date(last.getTime() + 1000) : new Date('2010-01-01T00:00:00Z')).toISOString();
   const endDate = new Date().toISOString();
   let inserted = 0;
   try {
-    const data = await raptGet('/api/Hydrometers/GetTelemetry', {
+    const data = await raptGet(token, '/api/Hydrometers/GetTelemetry', {
       hydrometerId,
       startDate,
       endDate,
@@ -280,24 +305,39 @@ async function runSync() {
   syncRunning = true;
   const t0 = Date.now();
   try {
-    const [profiles, controllers, hydrometers] = await Promise.all([
-      raptGet('/api/Profiles/GetProfiles'),
-      raptGet('/api/TemperatureControllers/GetTemperatureControllers'),
-      raptGet('/api/Hydrometers/GetHydrometers'),
-    ]);
-    await upsertProfiles(profiles);
-    await upsertControllers(controllers);
-    await upsertHydrometers(hydrometers);
+    const userProfiles = await fetchActiveProfiles();
+    if (userProfiles.length === 0) {
+      console.warn('[db-sync] no active user profiles (rapt creds missing) — skip');
+      return;
+    }
 
-    let cTotal = 0;
-    let hTotal = 0;
-    for (const c of controllers || []) cTotal += await syncControllerTelemetry(c.id);
-    for (const h of hydrometers || []) hTotal += await syncHydrometerTelemetry(h.id);
+    let totalProfiles = 0, totalCtrl = 0, totalHydro = 0, totalCtrlT = 0, totalHydroT = 0;
+
+    for (const up of userProfiles) {
+      try {
+        const token = await getToken(up.rapt_user_id, up.rapt_api_key);
+        const [profiles, controllers, hydrometers] = await Promise.all([
+          raptGet(token, '/api/Profiles/GetProfiles'),
+          raptGet(token, '/api/TemperatureControllers/GetTemperatureControllers'),
+          raptGet(token, '/api/Hydrometers/GetHydrometers'),
+        ]);
+        await upsertProfiles(profiles);
+        await upsertControllers(controllers);
+        await upsertHydrometers(hydrometers);
+        for (const c of controllers || []) totalCtrlT += await syncControllerTelemetry(token, c.id);
+        for (const h of hydrometers || []) totalHydroT += await syncHydrometerTelemetry(token, h.id);
+        totalProfiles += (profiles?.length || 0);
+        totalCtrl += (controllers?.length || 0);
+        totalHydro += (hydrometers?.length || 0);
+      } catch (e) {
+        console.warn(`[db-sync] user ${up.id} (${up.rapt_user_id}) sync failed:`, e.message);
+      }
+    }
 
     await deriveBrewSessions();
 
     const dur = Date.now() - t0;
-    console.log(`[db-sync] OK ${profiles?.length || 0} profiles, ${controllers?.length || 0} ctrl, ${hydrometers?.length || 0} hydro, +${cTotal} ctrl-tele, +${hTotal} hydro-tele in ${dur}ms`);
+    console.log(`[db-sync] OK ${userProfiles.length} user(s) ${totalProfiles} profiles, ${totalCtrl} ctrl, ${totalHydro} hydro, +${totalCtrlT} ctrl-tele, +${totalHydroT} hydro-tele in ${dur}ms`);
   } catch (e) {
     console.error('[db-sync] failed:', e.message);
   } finally {
