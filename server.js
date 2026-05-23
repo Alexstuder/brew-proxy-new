@@ -16,8 +16,19 @@ loadEnvFile(LOCAL_ENV);
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const RAPT_USERNAME = process.env.RAPT_USERNAME;
-const RAPT_API_KEY = process.env.RAPT_API_KEY;
+// Innerhalb Docker erreicht der Proxy Supabase über das interne Kong (Container-Name).
+// SUPABASE_PUBLIC_URL ist die Browser-URL (localhost / Cloudflare-Hostname) und wäre
+// vom Container aus nicht auflösbar.
+const SUPABASE_URL =
+  process.env.SUPABASE_INTERNAL_URL ??
+  process.env.SUPABASE_PUBLIC_URL ??
+  process.env.SUPABASE_URL ??
+  'http://supabase-kong:8000';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const BREWFATHER_BASE_URL = process.env.BREWFATHER_BASE_URL ?? 'https://api.brewfather.app/v2';
+// RAPT_USERNAME/RAPT_API_KEY werden NICHT mehr aus env gelesen.
+// Multi-User-Pattern: jeder User hat eigene RAPT-Creds in aibrewgenius.user_profiles,
+// Proxy holt sie pro Request via Supabase-JWT (siehe requireRaptCreds).
 const RAPT_TOKEN_ENDPOINT = process.env.RAPT_TOKEN_ENDPOINT ?? 'https://id.rapt.io/connect/token';
 const RAPT_API_BASE = process.env.RAPT_API_BASE ?? 'https://api.rapt.io';
 const RAPT_PROFILE_ENDPOINT = process.env.RAPT_PROFILE_ENDPOINT ?? '/api/Profiles/GetProfiles';
@@ -47,8 +58,9 @@ let controllersCache = null;
 let lastControllersFetchTime = 0;
 let lastHydrometersFetchTime = 0;
 let cachedHydrometers = [];
-let raptTokenCache = null;
-let raptTokenExpiry = 0;
+// Per-User RAPT-Token-Cache. Key = Supabase user_id. Wert = {token, expiry}.
+// Jeder Brewer hat sein eigenes RAPT-Konto -> eigener Token.
+const raptTokenCacheByUser = new Map();
 
 loadTelemetryCacheFromDisk();
 loadControllersCacheFromDisk();
@@ -73,7 +85,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/rapt/hydrometers' && req.method === 'GET') {
-      await handleRaptHydrometersRequest(res);
+      await handleRaptHydrometersRequest(req, res);
       return;
     }
     if (url.pathname === '/api/rapt/hydrometer-telemetry' && req.method === 'GET') {
@@ -90,11 +102,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (url.pathname === '/api/rapt/token' && req.method === 'POST') {
-      await handleRaptTokenRequest(res);
+      await handleRaptTokenRequest(req, res);
       return;
     }
     if (url.pathname === '/api/rapt/profiles' && req.method === 'GET') {
-      await handleRaptProfilesRequest(res);
+      await handleRaptProfilesRequest(req, res);
       return;
     }
     if (url.pathname === '/api/rapt/telemetry' && req.method === 'GET') {
@@ -118,11 +130,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (url.pathname === '/api/cache/telemetry' && req.method === 'GET') {
-      await handleTelemetryCacheResponse(res);
+      await handleTelemetryCacheResponse(req, res);
       return;
     }
     if (url.pathname === '/api/cache/controllers' && req.method === 'GET') {
-      await handleControllerCacheResponse(res);
+      await handleControllerCacheResponse(req, res);
+      return;
+    }
+    if (url.pathname.startsWith('/api/brewfather/')) {
+      await handleBrewfatherProxyRequest(req, res, url);
       return;
     }
 
@@ -150,14 +166,11 @@ const dbSync = require('./db-sync');
 server.listen(PORT, () => {
   console.log(`Proxy listening on http://localhost:${PORT}`);
   dbSync.init();   // Periodic sync RAPT API → Postgres (rapt.* schema)
-  const initialForce = !telemetryCache;
-  ensureTelemetryCache({
-    force: initialForce,
-    startDateOverride: getLastKnownStartDate(),
-  }).catch(err => {
-    console.error('Initial telemetry preload failed:', err.message || err);
-  });
-  scheduleHourlyTelemetryRefresh();
+  // Hintergrund-Telemetry-Refresh deaktiviert seit Multi-User:
+  // Es gibt keinen "system user" mehr, dessen Creds wir hätten — Refreshes
+  // werden nun pro Foreground-Request des eingeloggten Users ausgelöst.
+  // Disk-Cache wird nur noch von vorherigen User-Requests befüllt.
+  // (Siehe project_auth_migration für Multi-User-Roadmap.)
 });
 
 function setCorsHeaders(req, res) {
@@ -513,13 +526,11 @@ function extractResponseText(payload) {
   return textParts.join('\n').trim();
 }
 
-async function handleRaptTokenRequest(res) {
-  if (!RAPT_USERNAME || !RAPT_API_KEY) {
-    respondJson(res, 500, { error: 'RAPT credentials not configured.' });
-    return;
-  }
+async function handleRaptTokenRequest(req, res) {
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
   try {
-    const tokenData = await requestRaptToken();
+    const tokenData = await requestRaptTokenForUser(ctx);
     respondJson(res, 200, tokenData);
   } catch (error) {
     console.error('RAPT token error:', error);
@@ -528,13 +539,11 @@ async function handleRaptTokenRequest(res) {
   }
 }
 
-async function handleRaptProfilesRequest(res) {
-  if (!RAPT_USERNAME || !RAPT_API_KEY) {
-    respondJson(res, 500, { error: 'RAPT credentials not configured.' });
-    return;
-  }
+async function handleRaptProfilesRequest(req, res) {
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
   try {
-    const token = await requestRaptToken();
+    const token = await requestRaptTokenForUser(ctx);
     if (!token?.access_token) {
       respondJson(res, 502, { error: 'Token response invalid.' });
       return;
@@ -542,8 +551,8 @@ async function handleRaptProfilesRequest(res) {
     const base = RAPT_API_BASE.replace(/\/$/, '');
     const apiResponse = await fetch(`${base}${RAPT_PROFILE_ENDPOINT}`, {
       headers: {
-        'Authorization': `Bearer ${token.access_token}`,
-        'Accept': 'application/json',
+        Authorization: `Bearer ${token.access_token}`,
+        Accept: 'application/json',
       },
     });
     const payload = await apiResponse.json().catch(() => ({}));
@@ -559,13 +568,11 @@ async function handleRaptProfilesRequest(res) {
   }
 }
 
-async function handleRaptHydrometersRequest(res) {
-  if (!RAPT_USERNAME || !RAPT_API_KEY) {
-    respondJson(res, 500, { error: 'RAPT credentials not configured.' });
-    return;
-  }
+async function handleRaptHydrometersRequest(req, res) {
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
   try {
-    const token = await requestRaptToken();
+    const token = await requestRaptTokenForUser(ctx);
     if (!token?.access_token) {
       respondJson(res, 502, { error: 'Token response invalid.' });
       return;
@@ -573,11 +580,11 @@ async function handleRaptHydrometersRequest(res) {
     const base = RAPT_API_BASE.replace(/\/$/, '');
     const apiResponse = await fetch(`${base}/api/Hydrometers/GetHydrometers`, {
       headers: {
-        'Authorization': `Bearer ${token.access_token}`,
-        'Accept': 'application/json',
+        Authorization: `Bearer ${token.access_token}`,
+        Accept: 'application/json',
       },
     });
-    const payload = await apiResponse.json().catch(() => ([]));
+    const payload = await apiResponse.json().catch(() => []);
     if (!apiResponse.ok) {
       respondJson(res, apiResponse.status, payload);
       return;
@@ -591,10 +598,8 @@ async function handleRaptHydrometersRequest(res) {
 }
 
 async function handleDirectHydrometerTelemetryRequest(req, res) {
-  if (!RAPT_USERNAME || !RAPT_API_KEY) {
-    respondJson(res, 500, { error: 'RAPT credentials not configured.' });
-    return;
-  }
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const hydrometerId = url.searchParams.get('hydrometerId');
@@ -606,14 +611,12 @@ async function handleDirectHydrometerTelemetryRequest(req, res) {
       return;
     }
 
-    const token = await requestRaptToken();
+    const token = await requestRaptTokenForUser(ctx);
     if (!token?.access_token) {
       respondJson(res, 502, { error: 'Token response invalid.' });
       return;
     }
     const base = RAPT_API_BASE.replace(/\/$/, '');
-
-    // determine URL - ensure we use the correct endpoint path
     const teleUrl = new URL(`${base}/api/Hydrometers/GetTelemetry`);
     teleUrl.searchParams.set('hydrometerId', hydrometerId);
     teleUrl.searchParams.set('startDate', startDate);
@@ -621,19 +624,16 @@ async function handleDirectHydrometerTelemetryRequest(req, res) {
 
     const apiResponse = await fetch(teleUrl, {
       headers: {
-        'Authorization': `Bearer ${token.access_token}`,
-        'Accept': 'application/json',
+        Authorization: `Bearer ${token.access_token}`,
+        Accept: 'application/json',
       },
     });
-
-    const payload = await apiResponse.json().catch(() => ([]));
+    const payload = await apiResponse.json().catch(() => []);
     if (!apiResponse.ok) {
       respondJson(res, apiResponse.status, payload);
       return;
     }
-
     respondJson(res, 200, payload);
-
   } catch (error) {
     console.error('RAPT direct telemetry error:', error);
     const status = error.statusCode ?? 500;
@@ -642,10 +642,8 @@ async function handleDirectHydrometerTelemetryRequest(req, res) {
 }
 
 async function handleRaptTelemetryRequest(req, res) {
-  if (!RAPT_USERNAME || !RAPT_API_KEY) {
-    respondJson(res, 500, { error: 'RAPT credentials not configured.' });
-    return;
-  }
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const forceReload = ['1', 'true'].includes((url.searchParams.get('reload') || '').toLowerCase());
@@ -669,6 +667,7 @@ async function handleRaptTelemetryRequest(req, res) {
       : await ensureTelemetryCache({
         force: forceReload,
         startDateOverride: effectiveStartOverride,
+        userCtx: ctx,
       });
     let payloadData = data;
     const isLiveRequest = !effectiveStartOverride;
@@ -699,12 +698,15 @@ async function handleRaptTelemetryRequest(req, res) {
   }
 }
 
-async function handleTelemetryCacheResponse(res) {
+async function handleTelemetryCacheResponse(req, res) {
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
+
   let dataToSend = telemetryCache;
 
   if (!dataToSend) {
     try {
-      await ensureTelemetryCache({ force: false });
+      await ensureTelemetryCache({ force: false, userCtx: ctx });
       dataToSend = telemetryCache;
     } catch (error) {
       console.warn('Unable to refresh telemetry cache:', error.message || error);
@@ -817,12 +819,15 @@ async function tryServeFallbackFromDb() {
   }
 }
 
-async function handleControllerCacheResponse(res) {
+async function handleControllerCacheResponse(req, res) {
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
+
   let dataToSend = controllersCache;
 
   if (!dataToSend) {
     try {
-      await ensureTelemetryCache({ force: false });
+      await ensureTelemetryCache({ force: false, userCtx: ctx });
       dataToSend = controllersCache;
     } catch (error) {
       console.warn('Unable to refresh controller cache:', error.message || error);
@@ -897,18 +902,23 @@ async function handleRaptStartOverrideRequest(req, res) {
   respondJson(res, 405, { error: 'Method not allowed.' });
 }
 
-async function requestRaptToken() {
+/**
+ * Holt einen RAPT-Access-Token für einen konkreten User. Token wird pro userId gecached.
+ * Args: { username, apiKey, userId } — Creds kommen aus der DB (user_profiles), userId aus JWT.
+ */
+async function requestRaptTokenForUser({ username, apiKey, userId }) {
   const now = Date.now();
-  if (raptTokenCache && raptTokenExpiry > now + 60000) {
-    return raptTokenCache;
+  const cached = raptTokenCacheByUser.get(userId);
+  if (cached && cached.expiry > now + 60000) {
+    return cached.data;
   }
 
-  console.log('[Proxy] Requesting new RAPT token...');
+  console.log(`[Proxy] Requesting new RAPT token for user ${userId}...`);
   const body = new URLSearchParams({
     client_id: 'rapt-user',
     grant_type: 'password',
-    username: RAPT_USERNAME,
-    password: RAPT_API_KEY,
+    username,
+    password: apiKey,
   });
 
   const response = await fetch(RAPT_TOKEN_ENDPOINT, {
@@ -919,17 +929,189 @@ async function requestRaptToken() {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    console.error(`[Proxy] Token request failed with status ${response.status}:`, data);
-    const error = new Error(data.error_description || data.error || `Failed to fetch RAPT token (${response.status}).`);
+    console.error(`[Proxy] RAPT token request failed (status ${response.status}):`, data);
+    const error = new Error(
+      data.error_description || data.error || `Failed to fetch RAPT token (${response.status}).`,
+    );
     error.statusCode = response.status;
     throw error;
   }
 
-  raptTokenCache = data;
   const expiresIn = data.expires_in || 3600;
-  raptTokenExpiry = now + (expiresIn * 1000);
-  console.log(`[Proxy] New RAPT token received (expires in ${expiresIn}s).`);
+  raptTokenCacheByUser.set(userId, { data, expiry: now + expiresIn * 1000 });
+  console.log(`[Proxy] New RAPT token cached for user ${userId} (expires in ${expiresIn}s).`);
   return data;
+}
+
+// ============================================================================
+// Brewfather Proxy (per-user creds via Supabase JWT)
+// ============================================================================
+// Frontend sendet:  Authorization: Bearer <supabase-jwt>
+// Proxy:
+//   1. JWT extrahieren, Supabase-Client mit dem JWT bauen
+//   2. user_profiles via RLS-scoped Query lesen (User sieht nur eigene Row)
+//   3. Basic-Auth-Header für Brewfather aus DB-Creds bauen
+//   4. Request 1:1 forwarden, Response zurück
+// Brewfather-Credentials verlassen den Server nie Richtung Browser.
+
+function getJwtFromRequest(req) {
+  const header = req.headers.authorization || req.headers.Authorization;
+  if (!header) return null;
+  const match = /^Bearer\s+(.+)$/.exec(header);
+  return match ? match[1] : null;
+}
+
+async function getUserRaptCreds(jwt) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('SUPABASE_URL / SUPABASE_ANON_KEY not configured in proxy env.');
+  }
+  const url =
+    SUPABASE_URL.replace(/\/$/, '') +
+    '/rest/v1/user_profiles?select=rapt_user_id,rapt_api_key&limit=1';
+  const resp = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${jwt}`,
+      'Accept-Profile': 'aibrewgenius',
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`PostgREST user_profiles lookup failed (${resp.status}): ${body}`);
+  }
+  const rows = await resp.json();
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const row = rows[0];
+  if (!row.rapt_user_id || !row.rapt_api_key) return null;
+  return { username: row.rapt_user_id, apiKey: row.rapt_api_key };
+}
+
+/**
+ * Middleware-Helper: prüft JWT, lädt RAPT-Creds aus user_profiles.
+ * Bei Fehler wird die Response direkt geschickt und null zurückgegeben.
+ * Bei Erfolg: { jwt, userId, raptUsername, raptApiKey }.
+ */
+async function requireRaptCreds(req, res) {
+  const jwt = getJwtFromRequest(req);
+  if (!jwt) {
+    respondJson(res, 401, { error: 'Authorization Bearer token required.' });
+    return null;
+  }
+  let creds;
+  try {
+    creds = await getUserRaptCreds(jwt);
+  } catch (err) {
+    console.error('[RAPT] Supabase auth/profile error:', err.message || err);
+    respondJson(res, 401, { error: 'Auth check failed: ' + (err.message || 'unknown') });
+    return null;
+  }
+  if (!creds) {
+    respondJson(res, 400, {
+      error: 'RAPT-Credentials für diesen User nicht hinterlegt. Bitte im Profil eintragen.',
+    });
+    return null;
+  }
+  // user_id aus JWT extrahieren (Sub-Claim ohne Validierung — reicht als Cache-Key)
+  let userId = 'unknown';
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString());
+    userId = payload.sub || 'unknown';
+  } catch (_) {}
+  return {
+    jwt,
+    userId,
+    raptUsername: creds.username,
+    raptApiKey: creds.apiKey,
+  };
+}
+
+async function getUserBrewfatherCreds(jwt) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('SUPABASE_URL / SUPABASE_ANON_KEY not configured in proxy env.');
+  }
+  // PostgREST direkt aufrufen — kein supabase-js (vermeidet Realtime/WS-Dependency in Node 20).
+  // RLS-Policy 'user_owns_profile' filtert auf id = auth.uid(), liefert genau eine Row.
+  const url =
+    SUPABASE_URL.replace(/\/$/, '') +
+    '/rest/v1/user_profiles?select=brewfather_user_id,brewfather_api_key&limit=1';
+  const resp = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${jwt}`,
+      'Accept-Profile': 'aibrewgenius',
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`PostgREST user_profiles lookup failed (${resp.status}): ${body}`);
+  }
+  const rows = await resp.json();
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const row = rows[0];
+  if (!row.brewfather_user_id || !row.brewfather_api_key) return null;
+  return { userId: row.brewfather_user_id, apiKey: row.brewfather_api_key };
+}
+
+async function handleBrewfatherProxyRequest(req, res, url) {
+  // 1. JWT prüfen
+  const jwt = getJwtFromRequest(req);
+  if (!jwt) {
+    respondJson(res, 401, { error: 'Authorization Bearer token required.' });
+    return;
+  }
+
+  let creds;
+  try {
+    creds = await getUserBrewfatherCreds(jwt);
+  } catch (err) {
+    console.error('[Brewfather] Supabase auth/profile error:', err.message || err);
+    respondJson(res, 401, { error: 'Auth check failed: ' + (err.message || 'unknown') });
+    return;
+  }
+  if (!creds) {
+    respondJson(res, 400, {
+      error: 'Brewfather-Credentials für diesen User nicht hinterlegt. Bitte im Profil eintragen.',
+    });
+    return;
+  }
+
+  // 2. Ziel-URL bauen: /api/brewfather/<rest>?<query>  ->  <BREWFATHER_BASE_URL>/<rest>?<query>
+  const subPath = url.pathname.replace(/^\/api\/brewfather/, '');
+  const targetUrl = new URL(BREWFATHER_BASE_URL.replace(/\/$/, '') + subPath);
+  url.searchParams.forEach((value, key) => targetUrl.searchParams.set(key, value));
+
+  // 3. Basic Auth Header
+  const basicAuth =
+    'Basic ' + Buffer.from(`${creds.userId}:${creds.apiKey}`).toString('base64');
+
+  // 4. Forward Request
+  const fetchHeaders = {
+    Authorization: basicAuth,
+    Accept: 'application/json',
+  };
+  const fetchInit = {
+    method: req.method,
+    headers: fetchHeaders,
+  };
+  if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'PUT') {
+    const body = await readBody(req);
+    if (body) fetchInit.body = body;
+    fetchHeaders['Content-Type'] = req.headers['content-type'] || 'application/json';
+  }
+
+  try {
+    const bfResponse = await fetch(targetUrl, fetchInit);
+    const responseText = await bfResponse.text();
+    res.writeHead(bfResponse.status, {
+      'Content-Type': bfResponse.headers.get('content-type') || 'application/json',
+    });
+    res.end(responseText);
+  } catch (err) {
+    console.error('[Brewfather] Upstream error:', err.message || err);
+    respondJson(res, 502, { error: 'Brewfather upstream request failed: ' + (err.message || 'unknown') });
+  }
 }
 
 function readBody(req) {
@@ -1022,19 +1204,26 @@ function loadControllersCacheFromDisk() {
 }
 
 async function ensureTelemetryCache(options = {}) {
-  const { force = false, startDateOverride = null } = options;
+  const { force = false, startDateOverride = null, userCtx = null } = options;
+  // userCtx ist optional: bei foreground-Anfragen ist es der eingeloggte User
+  // (siehe handleRaptTelemetryRequest). Ohne Context kann nicht refresht werden —
+  // dann nur Cache zurückgeben.
+  if (!userCtx) {
+    if (telemetryCache) return telemetryCache;
+    throw new Error('Kein User-Context für RAPT-Refresh und kein Cache vorhanden.');
+  }
 
   if (startDateOverride) {
     if (!force && telemetryCache && telemetryCache.requestedStartDate === startDateOverride) {
       return telemetryCache;
     }
-    return refreshTelemetryCache(startDateOverride);
+    return refreshTelemetryCache(startDateOverride, false, userCtx);
   }
 
   if (force || !telemetryCache) {
     if (!telemetryCachePromise) {
-      console.log(`[Proxy] Starting telemetry refresh (force=${force})...`);
-      telemetryCachePromise = refreshTelemetryCache()
+      console.log(`[Proxy] Starting telemetry refresh (force=${force}) for user ${userCtx.userId}...`);
+      telemetryCachePromise = refreshTelemetryCache(null, false, userCtx)
         .then(data => {
           console.log('[Proxy] Telemetry refresh successful.');
           return data;
@@ -1054,12 +1243,11 @@ async function ensureTelemetryCache(options = {}) {
   return telemetryCache;
 }
 
-async function refreshTelemetryCache(startDateOverride = null, hasFallback = false) {
-  if (!RAPT_USERNAME || !RAPT_API_KEY) {
-    throw new Error('RAPT credentials not configured.');
+async function refreshTelemetryCache(startDateOverride = null, hasFallback = false, userCtx = null) {
+  if (!userCtx) {
+    throw new Error('refreshTelemetryCache: userCtx erforderlich (kein env-fallback mehr).');
   }
-
-  const token = await requestRaptToken();
+  const token = await requestRaptTokenForUser(userCtx);
   if (!token?.access_token) {
     const err = new Error('Token response invalid.');
     err.statusCode = 502;
@@ -1202,7 +1390,7 @@ async function refreshTelemetryCache(startDateOverride = null, hasFallback = fal
 
       if (shouldFallback) {
         persistedRaptStartDate = null;
-        return refreshTelemetryCache(null, true);
+        return refreshTelemetryCache(null, true, userCtx);
       }
 
       rows.push({
