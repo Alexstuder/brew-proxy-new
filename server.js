@@ -961,30 +961,39 @@ function getJwtFromRequest(req) {
   return match ? match[1] : null;
 }
 
-async function getUserRaptCreds(jwt) {
+/**
+ * Ruft eine SECURITY DEFINER PostgREST-RPC auf, die intern auth.uid() nutzt
+ * und nur die Creds des aufrufenden Users entschlüsselt zurückgibt.
+ * Der Proxy braucht keinen service_role-Key — der JWT des Users reicht.
+ */
+async function callMyCredsRpc(jwt, rpcName) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     throw new Error('SUPABASE_URL / SUPABASE_ANON_KEY not configured in proxy env.');
   }
-  const url =
-    SUPABASE_URL.replace(/\/$/, '') +
-    '/rest/v1/user_profiles?select=rapt_user_id,rapt_api_key&limit=1';
+  const url = SUPABASE_URL.replace(/\/$/, '') + '/rest/v1/rpc/' + rpcName;
   const resp = await fetch(url, {
+    method: 'POST',
     headers: {
       apikey: SUPABASE_ANON_KEY,
       Authorization: `Bearer ${jwt}`,
-      'Accept-Profile': 'aibrewgenius',
+      'Content-Profile': 'aibrewgenius',
+      'Content-Type': 'application/json',
       Accept: 'application/json',
     },
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
-    throw new Error(`PostgREST user_profiles lookup failed (${resp.status}): ${body}`);
+    throw new Error(`PostgREST RPC ${rpcName} failed (${resp.status}): ${body}`);
   }
   const rows = await resp.json();
   if (!Array.isArray(rows) || rows.length === 0) return null;
-  const row = rows[0];
-  if (!row.rapt_user_id || !row.rapt_api_key) return null;
-  return { username: row.rapt_user_id, apiKey: row.rapt_api_key };
+  return rows[0];
+}
+
+async function getUserRaptCreds(jwt) {
+  const row = await callMyCredsRpc(jwt, 'get_my_rapt_creds');
+  if (!row || !row.username || !row.api_key) return null;
+  return { username: row.username, apiKey: row.api_key };
 }
 
 /**
@@ -1027,31 +1036,9 @@ async function requireRaptCreds(req, res) {
 }
 
 async function getUserBrewfatherCreds(jwt) {
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    throw new Error('SUPABASE_URL / SUPABASE_ANON_KEY not configured in proxy env.');
-  }
-  // PostgREST direkt aufrufen — kein supabase-js (vermeidet Realtime/WS-Dependency in Node 20).
-  // RLS-Policy 'user_owns_profile' filtert auf id = auth.uid(), liefert genau eine Row.
-  const url =
-    SUPABASE_URL.replace(/\/$/, '') +
-    '/rest/v1/user_profiles?select=brewfather_user_id,brewfather_api_key&limit=1';
-  const resp = await fetch(url, {
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${jwt}`,
-      'Accept-Profile': 'aibrewgenius',
-      Accept: 'application/json',
-    },
-  });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    throw new Error(`PostgREST user_profiles lookup failed (${resp.status}): ${body}`);
-  }
-  const rows = await resp.json();
-  if (!Array.isArray(rows) || rows.length === 0) return null;
-  const row = rows[0];
-  if (!row.brewfather_user_id || !row.brewfather_api_key) return null;
-  return { userId: row.brewfather_user_id, apiKey: row.brewfather_api_key };
+  const row = await callMyCredsRpc(jwt, 'get_my_brewfather_creds');
+  if (!row || !row.user_id || !row.api_key) return null;
+  return { userId: row.user_id, apiKey: row.api_key };
 }
 
 async function handleBrewfatherProxyRequest(req, res, url) {
