@@ -869,6 +869,12 @@ async function handleRaptStartOverrideRequest(req, res) {
     res.end();
     return;
   }
+  // Auth-Gate: konsistent mit allen anderen /api/rapt/*-Routen. Vorher fehlte der
+  // Check komplett (GET/POST/DELETE liefen unauthentifiziert mit 200) — jeder konnte
+  // den globalen persistedRaptStartDate-State ändern. requireRaptCreds sendet bei
+  // fehlendem/ungültigem JWT 401 bzw. bei fehlenden RAPT-Creds 400 und gibt null zurück.
+  const ctx = await requireRaptCreds(req, res);
+  if (!ctx) return;
   if (req.method === 'GET') {
     respondJson(res, 200, { startDate: persistedRaptStartDate });
     return;
