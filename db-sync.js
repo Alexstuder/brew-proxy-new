@@ -64,7 +64,7 @@ async function getToken(owner, username, apiKey) {
     body,
     signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
-  const data = await resp.json();
+  const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(`RAPT auth failed for ${username}: ${data.error_description || resp.status}`);
 
   tokenCacheByUser.set(owner, {
@@ -84,7 +84,7 @@ async function raptGet(token, path, params = {}) {
     signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
   if (!resp.ok) throw new Error(`RAPT ${path} failed: ${resp.status}`);
-  return resp.json();
+  return resp.json().catch(() => ({}));
 }
 
 /// Lädt alle User-Profile mit RAPT-Credentials über die Service-RPC.

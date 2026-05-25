@@ -16,6 +16,20 @@ const LAST_CONTROLLER_CACHE_FILE = path.join(CACHE_DIR, 'last-controllers-cache.
 loadEnvFile(LOCAL_ENV);
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+// ---------------------------------------------------------------------------
+// Role validation — must run before any other env-reads that differ per role.
+// PROXY_ROLE=assistent  →  OpenAI + Brewfather routes, against assistent-Supabase, no db-sync.
+// PROXY_ROLE=rapt       →  RAPT routes + db-sync, against rapt-Supabase + db-rapt.
+// ---------------------------------------------------------------------------
+const PROXY_ROLE = process.env.PROXY_ROLE;
+if (PROXY_ROLE !== 'assistent' && PROXY_ROLE !== 'rapt') {
+  console.error(
+    `PROXY_ROLE must be "assistent" or "rapt" (got: ${JSON.stringify(PROXY_ROLE)}). ` +
+    'Set the PROXY_ROLE environment variable before starting.'
+  );
+  process.exit(1);
+}
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Innerhalb Docker erreicht der Proxy Supabase über das interne Kong (Container-Name).
 // SUPABASE_PUBLIC_URL ist die Browser-URL (localhost / Cloudflare-Hostname) und wäre
@@ -55,7 +69,9 @@ const IMAGE_FETCH_TIMEOUT_MS  = Number(process.env.IMAGE_FETCH_TIMEOUT_MS  ?? 15
 // Named independently from RAPT so auth latency can be tuned without affecting RAPT calls.
 const AUTH_FETCH_TIMEOUT_MS   = Number(process.env.AUTH_FETCH_TIMEOUT_MS   ?? 15000);
 
-if (!OPENAI_API_KEY) {
+// OPENAI_API_KEY is only required for the assistent role.
+// The rapt proxy does not call OpenAI — crashing for a missing key there would be wrong.
+if (PROXY_ROLE === 'assistent' && !OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY is not set. Provide it via environment variable or proxy/.env file.');
   process.exit(1);
 }
@@ -91,66 +107,77 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'Proxy is running', version: '0.1.0' }));
+      res.end(JSON.stringify({ status: 'Proxy is running', version: '0.1.0', role: PROXY_ROLE }));
       return;
     }
 
-    if (url.pathname === '/api/rapt/hydrometers' && req.method === 'GET') {
-      await handleRaptHydrometersRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/rapt/hydrometer-telemetry' && req.method === 'GET') {
-      await handleDirectHydrometerTelemetryRequest(req, res);
-      return;
+    // -----------------------------------------------------------------------
+    // Role-gated route dispatch.
+    // Routes not registered for the active role fall through to the 404 below.
+    // -----------------------------------------------------------------------
+
+    if (PROXY_ROLE === 'assistent') {
+      if (url.pathname === '/api/brew' && req.method === 'POST') {
+        await handleBrewRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/chat' && req.method === 'POST') {
+        await handleChatRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/picture' && req.method === 'POST') {
+        await handleGenerateImageRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/proxy-image' && req.method === 'GET') {
+        await handleProxyImageRequest(req, res);
+        return;
+      }
+      // /api/shop-search intentionally has no JWT gate (existing behaviour —
+      // noted for proxy-reviewer; not changed in this phase).
+      if (url.pathname === '/api/shop-search' && req.method === 'POST') {
+        await handleShopSearchRequest(req, res);
+        return;
+      }
+      if (url.pathname.startsWith('/api/brewfather/')) {
+        await handleBrewfatherProxyRequest(req, res, url);
+        return;
+      }
     }
 
-    if (url.pathname === '/api/brew' && req.method === 'POST') {
-      await handleBrewRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/shop-search' && req.method === 'POST') {
-      await handleShopSearchRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/rapt/token' && req.method === 'POST') {
-      await handleRaptTokenRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/rapt/profiles' && req.method === 'GET') {
-      await handleRaptProfilesRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/rapt/telemetry' && req.method === 'GET') {
-      await handleRaptTelemetryRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/rapt/telemetry/start-override') {
-      await handleRaptStartOverrideRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/chat' && req.method === 'POST') {
-      await handleChatRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/picture' && req.method === 'POST') {
-      await handleGenerateImageRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/proxy-image' && req.method === 'GET') {
-      await handleProxyImageRequest(req, res);
-      return;
-    }
-    if (url.pathname === '/api/cache/telemetry' && req.method === 'GET') {
-      await handleTelemetryCacheResponse(req, res);
-      return;
-    }
-    if (url.pathname === '/api/cache/controllers' && req.method === 'GET') {
-      await handleControllerCacheResponse(req, res);
-      return;
-    }
-    if (url.pathname.startsWith('/api/brewfather/')) {
-      await handleBrewfatherProxyRequest(req, res, url);
-      return;
+    if (PROXY_ROLE === 'rapt') {
+      if (url.pathname === '/api/rapt/hydrometers' && req.method === 'GET') {
+        await handleRaptHydrometersRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/rapt/hydrometer-telemetry' && req.method === 'GET') {
+        await handleDirectHydrometerTelemetryRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/rapt/token' && req.method === 'POST') {
+        await handleRaptTokenRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/rapt/profiles' && req.method === 'GET') {
+        await handleRaptProfilesRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/rapt/telemetry' && req.method === 'GET') {
+        await handleRaptTelemetryRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/rapt/telemetry/start-override') {
+        await handleRaptStartOverrideRequest(req, res);
+        return;
+      }
+      if (url.pathname === '/api/cache/telemetry' && req.method === 'GET') {
+        await handleTelemetryCacheResponse(req, res);
+        return;
+      }
+      if (url.pathname === '/api/cache/controllers' && req.method === 'GET') {
+        await handleControllerCacheResponse(req, res);
+        return;
+      }
     }
 
     res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -175,8 +202,12 @@ const server = http.createServer(async (req, res) => {
 const dbSync = require('./db-sync');
 
 server.listen(PORT, () => {
-  console.log(`Proxy listening on http://localhost:${PORT}`);
-  dbSync.init();   // Periodic sync RAPT API → Postgres (rapt.* schema)
+  console.log(`Proxy listening on http://localhost:${PORT} (role=${PROXY_ROLE})`);
+  if (PROXY_ROLE === 'rapt') {
+    // Periodic sync RAPT API → Postgres (rapt.* schema).
+    // Not started for the assistent role: no db-rapt connection, no RAPT creds there.
+    dbSync.init();
+  }
   // Hintergrund-Telemetry-Refresh deaktiviert seit Multi-User:
   // Es gibt keinen "system user" mehr, dessen Creds wir hätten — Refreshes
   // werden nun pro Foreground-Request des eingeloggten Users ausgelöst.
