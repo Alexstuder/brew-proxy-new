@@ -2,6 +2,7 @@ const http = require('http');
 const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
+const dns = require('node:dns/promises');
 const { searchShops } = require('./services/shopCrawler');
 
 const BASE_PATH = __dirname;
@@ -43,6 +44,13 @@ const ALLOWED_ORIGINS = ALLOWED_ORIGIN_RAW.split(',')
   .map(value => value.trim())
   .filter(Boolean);
 const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.includes('*');
+
+// Outbound fetch timeouts. Override via env; no var is required — these are safe defaults.
+const OPENAI_FETCH_TIMEOUT_MS = Number(process.env.OPENAI_FETCH_TIMEOUT_MS ?? 60000);
+const RAPT_FETCH_TIMEOUT_MS   = Number(process.env.RAPT_FETCH_TIMEOUT_MS   ?? 15000);
+const BF_FETCH_TIMEOUT_MS     = Number(process.env.BF_FETCH_TIMEOUT_MS     ?? 15000);
+// Separate timeout for /api/proxy-image: proxying public image URLs, not RAPT-specific.
+const IMAGE_FETCH_TIMEOUT_MS  = Number(process.env.IMAGE_FETCH_TIMEOUT_MS  ?? 15000);
 
 if (!OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY is not set. Provide it via environment variable or proxy/.env file.');
@@ -225,7 +233,7 @@ async function handleChatRequest(req, res) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
@@ -235,6 +243,7 @@ async function handleChatRequest(req, res) {
         ],
         temperature: 0.7,
       }),
+      signal: AbortSignal.timeout(OPENAI_FETCH_TIMEOUT_MS),
     });
 
     const payload = await openAiResponse.json();
@@ -254,6 +263,10 @@ async function handleChatRequest(req, res) {
     respondJson(res, 200, { result: content.trim() });
   } catch (error) {
     console.error('Proxy error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'OpenAI request timed out.' });
+      return;
+    }
     respondJson(res, 500, { error: 'Interner Proxy-Fehler.' });
   }
 }
@@ -310,13 +323,22 @@ async function handleGenerateImageRequest(req, res) {
         messages: [{ role: 'user', content: userContent }],
         temperature: 0.7,
       }),
+      signal: AbortSignal.timeout(OPENAI_FETCH_TIMEOUT_MS),
     });
 
     const refinePayload = await refineResponse.json();
+
+    if (!refineResponse.ok) {
+      // Log full upstream error server-side only; do not forward OpenAI error details to client.
+      console.error('[Proxy] Prompt-Refinement OpenAI error:', refineResponse.status, refinePayload);
+      respondJson(res, refineResponse.status, { error: 'Prompt-Refinement fehlgeschlagen.' });
+      return;
+    }
+
     const refinedPrompt = refinePayload.choices?.[0]?.message?.content?.trim();
 
     if (!refinedPrompt) {
-      respondJson(res, 502, { error: 'Prompt-Refinement fehlgeschlagen.', details: refinePayload });
+      respondJson(res, 502, { error: 'Prompt-Refinement fehlgeschlagen.' });
       return;
     }
 
@@ -336,6 +358,7 @@ async function handleGenerateImageRequest(req, res) {
         size: '1024x1024',
         quality: 'medium',
       }),
+      signal: AbortSignal.timeout(OPENAI_FETCH_TIMEOUT_MS),
     });
 
     const imagePayload = await imageResponse.json();
@@ -357,6 +380,10 @@ async function handleGenerateImageRequest(req, res) {
     respondJson(res, 200, { result: `data:image/png;base64,${b64}` });
   } catch (error) {
     console.error('Proxy error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'OpenAI request timed out.' });
+      return;
+    }
     respondJson(res, 500, { error: 'Interner Proxy-Fehler.' });
   }
 }
@@ -371,7 +398,17 @@ async function handleProxyImageRequest(req, res) {
       return;
     }
 
-    const imageResponse = await fetch(imageUrl);
+    // SSRF guard: only allow public https URLs; reject loopback, private ranges,
+    // link-local (including cloud-metadata 169.254.169.254), and non-https schemes.
+    const safe = await isSafePublicHttpsUrl(imageUrl);
+    if (!safe) {
+      respondJson(res, 400, { error: 'Ungültige Bild-URL' });
+      return;
+    }
+
+    const imageResponse = await fetch(imageUrl, {
+      signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS),
+    });
 
     if (!imageResponse.ok) {
       respondJson(res, imageResponse.status, { error: 'Failed to fetch image from source.' });
@@ -390,6 +427,10 @@ async function handleProxyImageRequest(req, res) {
 
   } catch (error) {
     console.error('Proxy image error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'Image fetch timed out.' });
+      return;
+    }
     respondJson(res, 500, { error: 'Interner Proxy-Fehler beim Laden des Bildes.' });
   }
 }
@@ -442,6 +483,7 @@ async function handleBrewRequest(req, res) {
         ],
         temperature: 0.7,
       }),
+      signal: AbortSignal.timeout(OPENAI_FETCH_TIMEOUT_MS),
     });
 
     const payload = await openAiResponse.json();
@@ -465,6 +507,10 @@ async function handleBrewRequest(req, res) {
     respondJson(res, 200, { result: content.trim() });
   } catch (error) {
     console.error('Proxy error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'OpenAI request timed out.' });
+      return;
+    }
     respondJson(res, 500, { error: 'Interner Proxy-Fehler.' });
   }
 }
@@ -554,6 +600,7 @@ async function handleRaptProfilesRequest(req, res) {
         Authorization: `Bearer ${token.access_token}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
     });
     const payload = await apiResponse.json().catch(() => ({}));
     if (!apiResponse.ok) {
@@ -563,6 +610,10 @@ async function handleRaptProfilesRequest(req, res) {
     respondJson(res, 200, payload);
   } catch (error) {
     console.error('RAPT devices error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'RAPT request timed out.' });
+      return;
+    }
     const status = error.statusCode ?? 500;
     respondJson(res, status, { error: error.message ?? 'RAPT devices request failed.' });
   }
@@ -583,6 +634,7 @@ async function handleRaptHydrometersRequest(req, res) {
         Authorization: `Bearer ${token.access_token}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
     });
     const payload = await apiResponse.json().catch(() => []);
     if (!apiResponse.ok) {
@@ -592,6 +644,10 @@ async function handleRaptHydrometersRequest(req, res) {
     respondJson(res, 200, payload);
   } catch (error) {
     console.error('RAPT hydrometers error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'RAPT request timed out.' });
+      return;
+    }
     const status = error.statusCode ?? 500;
     respondJson(res, status, { error: error.message ?? 'RAPT hydrometers request failed.' });
   }
@@ -627,6 +683,7 @@ async function handleDirectHydrometerTelemetryRequest(req, res) {
         Authorization: `Bearer ${token.access_token}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
     });
     const payload = await apiResponse.json().catch(() => []);
     if (!apiResponse.ok) {
@@ -636,6 +693,10 @@ async function handleDirectHydrometerTelemetryRequest(req, res) {
     respondJson(res, 200, payload);
   } catch (error) {
     console.error('RAPT direct telemetry error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'RAPT request timed out.' });
+      return;
+    }
     const status = error.statusCode ?? 500;
     respondJson(res, status, { error: error.message ?? 'RAPT telemetry request failed.' });
   }
@@ -693,6 +754,10 @@ async function handleRaptTelemetryRequest(req, res) {
     respondJson(res, 200, payload);
   } catch (error) {
     console.error('RAPT telemetry error:', error);
+    if (isTimeoutError(error)) {
+      respondJson(res, 504, { error: 'RAPT request timed out.' });
+      return;
+    }
     const status = error.statusCode ?? 500;
     respondJson(res, status, { error: error.message ?? 'RAPT telemetry request failed.' });
   }
@@ -931,7 +996,7 @@ async function requestRaptTokenForUser({ username, apiKey, userId }) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
 
   const data = await response.json().catch(() => ({}));
@@ -987,7 +1052,7 @@ async function callMyCredsRpc(jwt, rpcName, schema = 'aibrewgenius') {
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
@@ -1089,6 +1154,7 @@ async function handleBrewfatherProxyRequest(req, res, url) {
   const fetchInit = {
     method: req.method,
     headers: fetchHeaders,
+    signal: AbortSignal.timeout(BF_FETCH_TIMEOUT_MS),
   };
   if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'PUT') {
     const body = await readBody(req);
@@ -1105,7 +1171,11 @@ async function handleBrewfatherProxyRequest(req, res, url) {
     res.end(responseText);
   } catch (err) {
     console.error('[Brewfather] Upstream error:', err.message || err);
-    respondJson(res, 502, { error: 'Brewfather upstream request failed: ' + (err.message || 'unknown') });
+    if (isTimeoutError(err)) {
+      respondJson(res, 504, { error: 'Brewfather upstream request timed out.' });
+      return;
+    }
+    respondJson(res, 502, { error: 'Brewfather upstream request failed.' });
   }
 }
 
@@ -1120,9 +1190,100 @@ function readBody(req) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// SSRF guard for /api/proxy-image
+// ---------------------------------------------------------------------------
+// Returns true only when `rawUrl` is a syntactically valid https: URL whose
+// resolved host is a publicly-routable address.
+//
+// IP ranges blocked (RFC-1918, loopback, link-local, unique-local):
+//   IPv4: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+//         169.254.0.0/16 (link-local / AWS metadata)
+//   IPv6: ::1, fc00::/7 (unique-local), fe80::/10 (link-local)
+//
+// DNS resolution is attempted once (A/AAAA) to catch numeric-IP hostnames and
+// private-range aliases. This is a best-effort first cut: a determined attacker
+// with a DNS-rebinding attack could still bypass, but that requires TTL tricks
+// beyond typical SSRF. A stricter approach would re-resolve at fetch time —
+// flagged for future hardening if needed.
+async function isSafePublicHttpsUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+
+  if (parsed.protocol !== 'https:') return false;
+
+  const hostname = parsed.hostname;
+
+  // Block literal IPs in private ranges before DNS lookup.
+  if (isPrivateIp(hostname)) return false;
+
+  // Also block bare "localhost" (case-insensitive) and .local/.internal TLDs.
+  const lc = hostname.toLowerCase();
+  if (lc === 'localhost') return false;
+  if (lc.endsWith('.local') || lc.endsWith('.internal')) return false;
+
+  // Resolve hostname and check every returned address.
+  try {
+    const records = await dns.lookup(hostname, { all: true });
+    for (const record of records) {
+      if (isPrivateIp(record.address)) return false;
+    }
+  } catch {
+    // DNS resolution failure → treat as unsafe (don't fetch unknown hosts).
+    return false;
+  }
+
+  return true;
+}
+
+// Returns true if `ip` (string) falls within a private/loopback/link-local range.
+function isPrivateIp(ip) {
+  // IPv6 loopback
+  if (ip === '::1') return true;
+
+  // Strip IPv6 brackets e.g. [::1]
+  const addr = ip.startsWith('[') ? ip.slice(1, -1) : ip;
+
+  // IPv6 unique-local fc00::/7 and link-local fe80::/10
+  if (addr.includes(':')) {
+    const lc = addr.toLowerCase();
+    if (lc === '::1') return true;
+    // fc00::/7 covers fc00:: – fdff::
+    if (lc.startsWith('fc') || lc.startsWith('fd')) return true;
+    // fe80::/10
+    if (lc.startsWith('fe8') || lc.startsWith('fe9') ||
+        lc.startsWith('fea') || lc.startsWith('feb')) return true;
+    return false;
+  }
+
+  // IPv4
+  const parts = addr.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return false;
+  const [a, b] = parts;
+  if (a === 127) return true;                              // 127.0.0.0/8  loopback
+  if (a === 10) return true;                               // 10.0.0.0/8   private
+  if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16.0.0/12 private
+  if (a === 192 && b === 168) return true;                 // 192.168.0.0/16 private
+  if (a === 169 && b === 254) return true;                 // 169.254.0.0/16 link-local / metadata
+  return false;
+}
+
 function respondJson(res, statusCode, payload) {
   res.writeHead(statusCode, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(payload));
+}
+
+/**
+ * Returns true when an error is an AbortSignal timeout (DOMException name
+ * "TimeoutError") or a plain AbortError, so callers can reply with 504.
+ */
+function isTimeoutError(err) {
+  if (!err) return false;
+  return err.name === 'TimeoutError' || err.name === 'AbortError';
 }
 
 function normalizeStartDateParam(value) {
@@ -1439,6 +1600,7 @@ async function fetchTemperatureControllers(base, accessToken) {
       'Authorization': `Bearer ${accessToken}`,
       'Accept': 'application/json',
     },
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
   const payload = await response.json().catch(() => []);
   if (!response.ok) {
@@ -1467,6 +1629,7 @@ async function fetchHydrometers(base, accessToken) {
       'Authorization': `Bearer ${accessToken}`,
       'Accept': 'application/json',
     },
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
   const payload = await response.json().catch(() => []);
   if (!response.ok) {
@@ -1620,6 +1783,7 @@ async function requestHydrometerTelemetry(base, accessToken, hydrometerId, start
       'Authorization': `Bearer ${accessToken}`,
       'Accept': 'application/json',
     },
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
   const payload = await response.json().catch(() => []);
   if (!response.ok) {
@@ -1641,48 +1805,6 @@ function getLastKnownStartDate() {
 }
 
 
-function scheduleHourlyTelemetryRefresh() {
-  const scheduleNext = () => {
-    const delay = getMsUntilNextHour();
-    console.log(`[Scheduler] Next telemetry refresh scheduled in ${Math.round(delay / 1000 / 60)} minutes.`);
-    setTimeout(async () => {
-      console.log('[Scheduler] Starting hourly telemetry refresh...');
-
-      // 1. Backup current cache to 'last-' files ONLY if we currently have an active session.
-      // This ensures 'last' files always contain the most recent *active* state.
-      try {
-        if (hasActiveSessionInCache()) {
-          console.log('[Scheduler] Active session detected in current cache. Backing up to last-cache files.');
-          if (fs.existsSync(TELEMETRY_CACHE_FILE)) {
-            fs.copyFileSync(TELEMETRY_CACHE_FILE, LAST_TELEMETRY_CACHE_FILE);
-          }
-          if (fs.existsSync(CONTROLLER_CACHE_FILE)) {
-            fs.copyFileSync(CONTROLLER_CACHE_FILE, LAST_CONTROLLER_CACHE_FILE);
-          }
-        } else {
-          console.log('[Scheduler] No active session in current cache. Skipping backup to preserve previous active state.');
-        }
-      } catch (backupErr) {
-        console.error('[Scheduler] Backup failed:', backupErr);
-      }
-
-      // 2. Refresh Telemetry
-      try {
-        await ensureTelemetryCache({
-          force: true,
-          startDateOverride: getLastKnownStartDate(),
-        });
-        console.log('[Scheduler] Hourly refresh completed.');
-      } catch (err) {
-        console.error('[Scheduler] Telemetry refresh failed:', err.message || err);
-      }
-
-      scheduleNext();
-    }, delay);
-  };
-  scheduleNext();
-}
-
 function hasActiveSessionInCache() {
   // Check in-memory first
   if (controllersCache && Array.isArray(controllersCache.controllers)) {
@@ -1691,29 +1813,6 @@ function hasActiveSessionInCache() {
   return false;
 }
 
-function getMsUntilNextHour(referenceTime = Date.now()) {
-  const referenceDate = new Date(referenceTime);
-  referenceDate.setMinutes(0, 0, 0);
-  // Add 1 hour
-  const nextHourMs = referenceDate.getTime() + (60 * 60 * 1000);
-  // If we are currently exactly at 00, add another hour? 
-  // ensureTelemetryCache runs, then schedules next. 
-  // If we are at 09:00:01, next is 10:00:00.
-  // The logic below adds INTERVAL (which is 1h) to the rounded-down hour?
-  // Original logic: referenceDate + CACHE_INTERVAL_MS. 
-  // If referenceDate is 09:00:00, +1h = 10:00:00.
-  // If current time is 09:30, referenceDate is 09:00. +1h = 10:00. diff = 30min. Correct.
-  // But usage of CACHE_INTERVAL_MS variable is safer if we want to config it.
-  // Assuming CACHE_INTERVAL_MS is 1 hour (3600000).
-  const nextHourMsCalculated = referenceDate.getTime() + 3600000;
-
-  // Calculate delay, but ensure we don't fire immediately if we are super close
-  const delay = nextHourMsCalculated - referenceTime;
-  // If delay is negative (shouldn't happen with math above) or very small, wait 1h?
-  // For safety, just use the logic: Next top of the hour.
-
-  return Math.max(1000, delay);
-}
 
 function loadEnvFile(filePath) {
   try {
