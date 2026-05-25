@@ -51,6 +51,9 @@ const RAPT_FETCH_TIMEOUT_MS   = Number(process.env.RAPT_FETCH_TIMEOUT_MS   ?? 15
 const BF_FETCH_TIMEOUT_MS     = Number(process.env.BF_FETCH_TIMEOUT_MS     ?? 15000);
 // Separate timeout for /api/proxy-image: proxying public image URLs, not RAPT-specific.
 const IMAGE_FETCH_TIMEOUT_MS  = Number(process.env.IMAGE_FETCH_TIMEOUT_MS  ?? 15000);
+// Timeout for the Supabase /auth/v1/user call inside requireAuthenticatedUser.
+// Named independently from RAPT so auth latency can be tuned without affecting RAPT calls.
+const AUTH_FETCH_TIMEOUT_MS   = Number(process.env.AUTH_FETCH_TIMEOUT_MS   ?? 15000);
 
 if (!OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY is not set. Provide it via environment variable or proxy/.env file.');
@@ -199,6 +202,8 @@ function setCorsHeaders(req, res) {
 }
 
 async function handleChatRequest(req, res) {
+  const authCtx = await requireAuthenticatedUser(req, res);
+  if (!authCtx) return;
   try {
     const body = await readBody(req);
     const data = JSON.parse(body || '{}');
@@ -272,6 +277,8 @@ async function handleChatRequest(req, res) {
 }
 
 async function handleGenerateImageRequest(req, res) {
+  const authCtx = await requireAuthenticatedUser(req, res);
+  if (!authCtx) return;
   try {
     const body = await readBody(req);
     const data = JSON.parse(body || '{}');
@@ -418,6 +425,11 @@ async function handleProxyImageRequest(req, res) {
     const contentType = imageResponse.headers.get('content-type') || 'image/png';
     res.writeHead(200, {
       'Content-Type': contentType,
+      // Intentional wildcard: this route serves public AI-generated image blobs for use
+      // in <img src> / img-src contexts from any origin. The SSRF guard above ensures the
+      // source URL is a safe public HTTPS resource, so '*' here is deliberate and correct.
+      // The top-level setCorsHeaders call already ran with the configured CORS_ORIGIN; we
+      // override it here because img-src does not benefit from credential-scoped CORS.
       'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'public, max-age=3600',
     });
@@ -436,6 +448,8 @@ async function handleProxyImageRequest(req, res) {
 }
 
 async function handleBrewRequest(req, res) {
+  const authCtx = await requireAuthenticatedUser(req, res);
+  if (!authCtx) return;
   try {
     const body = await readBody(req);
     const data = JSON.parse(body || '{}');
@@ -491,8 +505,7 @@ async function handleBrewRequest(req, res) {
     if (!openAiResponse.ok) {
       console.error('OpenAI API error:', openAiResponse.status, payload);
       respondJson(res, openAiResponse.status, {
-        error: payload?.error?.message || payload?.error || 'OpenAI API request failed.',
-        details: payload,
+        error: payload?.error?.message || 'OpenAI API request failed.',
       });
       return;
     }
@@ -500,7 +513,8 @@ async function handleBrewRequest(req, res) {
     const content = extractResponseText(payload);
 
     if (!content) {
-      respondJson(res, 502, { error: 'Antwort von OpenAI unvollständig.', payload });
+      console.error('OpenAI empty content payload:', payload);
+      respondJson(res, 502, { error: 'Antwort von OpenAI unvollständig.' });
       return;
     }
 
@@ -1106,6 +1120,53 @@ async function requireRaptCreds(req, res) {
     raptUsername: creds.username,
     raptApiKey: creds.apiKey,
   };
+}
+
+/**
+ * Middleware-Helper: prüft, ob der JWT-Bearer valide und nicht abgelaufen ist.
+ * Wird von OpenAI-Routen (/api/chat, /api/brew, /api/picture) verwendet, die
+ * keine per-User-Creds brauchen, aber trotzdem nur authentifizierten Usern
+ * offenstehen sollen.
+ *
+ * Validierung: GET <SUPABASE_URL>/auth/v1/user mit dem User-JWT als Bearer.
+ * Supabase Kong prüft Signatur + Ablaufzeit serverseitig — kein service_role-Key nötig.
+ * Bei Fehler: schreibt 401 (generisch, kein Secret-Leak) und gibt null zurück.
+ * Bei Erfolg: gibt { userId } zurück.
+ */
+async function requireAuthenticatedUser(req, res) {
+  const jwt = getJwtFromRequest(req);
+  if (!jwt) {
+    respondJson(res, 401, { error: 'Authorization Bearer token required.' });
+    return null;
+  }
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    console.error('[Auth] SUPABASE_URL / SUPABASE_ANON_KEY not configured.');
+    respondJson(res, 401, { error: 'Auth check failed.' });
+    return null;
+  }
+  try {
+    const authUrl = SUPABASE_URL.replace(/\/$/, '') + '/auth/v1/user';
+    const authResp = await fetch(authUrl, {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${jwt}`,
+      },
+      signal: AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS),
+    });
+    if (!authResp.ok) {
+      // Log status only — never log the JWT or response body (may contain token details).
+      console.warn(`[Auth] Supabase /auth/v1/user rejected token (status ${authResp.status}).`);
+      respondJson(res, 401, { error: 'Unauthorized.' });
+      return null;
+    }
+    const user = await authResp.json().catch(() => null);
+    const userId = user?.id || 'unknown';
+    return { userId };
+  } catch (err) {
+    console.error('[Auth] requireAuthenticatedUser error:', err.message || err);
+    respondJson(res, 401, { error: 'Auth check failed.' });
+    return null;
+  }
 }
 
 async function getUserBrewfatherCreds(jwt) {
