@@ -27,7 +27,7 @@ Image-Definition: siehe [`Dockerfile`](Dockerfile) (Playwright-Base + Node).
 ## Lokales Dev
 
 ```bash
-cp .env.example .env       # OPENAI_API_KEY, RAPT_USERNAME, RAPT_API_KEY
+cp .env.example .env       # OPENAI_API_KEY
 npm install
 npm start                  # läuft auf :3000
 ```

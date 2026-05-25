@@ -10,11 +10,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const SYNC_INTERVAL_MS = Number(process.env.RAPT_SYNC_INTERVAL_MS ?? 5 * 60 * 1000);
 const SYNC_ENABLED = process.env.RAPT_SYNC_ENABLED !== 'false';
 
-// Fallback-Credentials aus Env (für Notfall / Initial-Bootstrap). Primär liest
-// db-sync die Credentials pro Sync-Lauf aus rapt.user_profiles, damit jeder
-// User später seine eigenen Keys verwalten kann (multi-user-ready).
-const ENV_FALLBACK_RAPT_USERNAME = process.env.RAPT_USERNAME;
-const ENV_FALLBACK_RAPT_API_KEY = process.env.RAPT_API_KEY;
 const RAPT_TOKEN_ENDPOINT = process.env.RAPT_TOKEN_ENDPOINT ?? 'https://id.rapt.io/connect/token';
 const RAPT_API_BASE = process.env.RAPT_API_BASE ?? 'https://api.rapt.io';
 
@@ -28,7 +23,7 @@ function ready() {
 
 function init() {
   if (!ready()) {
-    console.log('[db-sync] disabled (missing DATABASE_URL or RAPT creds)');
+    console.log('[db-sync] disabled (RAPT_SYNC_ENABLED=false or missing DATABASE_URL)');
     return;
   }
   pool = new Pool({ connectionString: DATABASE_URL, max: 5 });
@@ -87,17 +82,7 @@ async function fetchActiveProfiles() {
     SELECT id, rapt_user_id, rapt_api_key FROM rapt.user_profiles
     WHERE rapt_user_id IS NOT NULL AND rapt_api_key IS NOT NULL
   `);
-  if (res.rows.length > 0) return res.rows;
-  // Fallback auf Env wenn die Tabelle leer (für Erstmigration)
-  if (ENV_FALLBACK_RAPT_USERNAME && ENV_FALLBACK_RAPT_API_KEY) {
-    console.warn('[db-sync] no profiles in rapt.user_profiles, falling back to env vars');
-    return [{
-      id: 'env-fallback',
-      rapt_user_id: ENV_FALLBACK_RAPT_USERNAME,
-      rapt_api_key: ENV_FALLBACK_RAPT_API_KEY,
-    }];
-  }
-  return [];
+  return res.rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +316,7 @@ async function deriveBrewSessions() {
 // ---------------------------------------------------------------------------
 
 let syncRunning = false;
+let lastSyncPaused = false; // tracks paused/active state for transition logging only
 
 async function runSync() {
   if (syncRunning) {
@@ -342,8 +328,15 @@ async function runSync() {
   try {
     const userProfiles = await fetchActiveProfiles();
     if (userProfiles.length === 0) {
-      console.warn('[db-sync] no active user profiles (rapt creds missing) — skip');
+      if (!lastSyncPaused) {
+        console.log('[db-sync] no RAPT creds in rapt.user_profiles — sync paused');
+        lastSyncPaused = true;
+      }
       return;
+    }
+    if (lastSyncPaused) {
+      console.log('[db-sync] RAPT creds found — sync resumed');
+      lastSyncPaused = false;
     }
 
     let totalProfiles = 0, totalCtrl = 0, totalHydro = 0, totalCtrlT = 0, totalHydroT = 0;
