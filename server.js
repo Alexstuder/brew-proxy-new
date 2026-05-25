@@ -931,6 +931,7 @@ async function requestRaptTokenForUser({ username, apiKey, userId }) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
+    signal: AbortSignal.timeout(15000),
   });
 
   const data = await response.json().catch(() => ({}));
@@ -972,7 +973,7 @@ function getJwtFromRequest(req) {
  * und nur die Creds des aufrufenden Users entschlüsselt zurückgibt.
  * Der Proxy braucht keinen service_role-Key — der JWT des Users reicht.
  */
-async function callMyCredsRpc(jwt, rpcName) {
+async function callMyCredsRpc(jwt, rpcName, schema = 'aibrewgenius') {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     throw new Error('SUPABASE_URL / SUPABASE_ANON_KEY not configured in proxy env.');
   }
@@ -982,10 +983,11 @@ async function callMyCredsRpc(jwt, rpcName) {
     headers: {
       apikey: SUPABASE_ANON_KEY,
       Authorization: `Bearer ${jwt}`,
-      'Content-Profile': 'aibrewgenius',
+      'Content-Profile': schema,
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
+    signal: AbortSignal.timeout(15000),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
@@ -997,7 +999,7 @@ async function callMyCredsRpc(jwt, rpcName) {
 }
 
 async function getUserRaptCreds(jwt) {
-  const row = await callMyCredsRpc(jwt, 'get_my_rapt_creds');
+  const row = await callMyCredsRpc(jwt, 'get_my_rapt_creds', 'rapt');
   if (!row || !row.username || !row.api_key) return null;
   return { username: row.username, apiKey: row.api_key };
 }
@@ -1018,7 +1020,7 @@ async function requireRaptCreds(req, res) {
     creds = await getUserRaptCreds(jwt);
   } catch (err) {
     console.error('[RAPT] Supabase auth/profile error:', err.message || err);
-    respondJson(res, 401, { error: 'Auth check failed: ' + (err.message || 'unknown') });
+    respondJson(res, 401, { error: 'Auth check failed.' });
     return null;
   }
   if (!creds) {
@@ -1060,7 +1062,7 @@ async function handleBrewfatherProxyRequest(req, res, url) {
     creds = await getUserBrewfatherCreds(jwt);
   } catch (err) {
     console.error('[Brewfather] Supabase auth/profile error:', err.message || err);
-    respondJson(res, 401, { error: 'Auth check failed: ' + (err.message || 'unknown') });
+    respondJson(res, 401, { error: 'Auth check failed.' });
     return;
   }
   if (!creds) {

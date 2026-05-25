@@ -12,6 +12,7 @@ const SYNC_ENABLED = process.env.RAPT_SYNC_ENABLED !== 'false';
 
 const RAPT_TOKEN_ENDPOINT = process.env.RAPT_TOKEN_ENDPOINT ?? 'https://id.rapt.io/connect/token';
 const RAPT_API_BASE = process.env.RAPT_API_BASE ?? 'https://api.rapt.io';
+const RAPT_FETCH_TIMEOUT_MS = Number(process.env.RAPT_FETCH_TIMEOUT_MS ?? 15000);
 
 let pool = null;
 // Token-Cache pro RAPT-Username (für multi-user später)
@@ -54,6 +55,7 @@ async function getToken(username, apiKey) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
   });
   const data = await resp.json();
   if (!resp.ok) throw new Error(`RAPT auth failed for ${username}: ${data.error_description || resp.status}`);
@@ -70,18 +72,19 @@ async function raptGet(token, path, params = {}) {
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, v);
   }
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(RAPT_FETCH_TIMEOUT_MS),
+  });
   if (!resp.ok) throw new Error(`RAPT ${path} failed: ${resp.status}`);
   return resp.json();
 }
 
-/// Lädt alle User-Profile mit RAPT-Credentials. Bei multi-user gibt's
-/// mehrere Rows, jede mit eigenen Keys.
+/// Lädt alle User-Profile mit RAPT-Credentials über die Service-RPC.
+/// Die SECURITY DEFINER-Funktion entschlüsselt intern den Vault und gibt
+/// nur konfigurierte User zurück. Kein Direktzugriff auf rapt.user_profiles.
 async function fetchActiveProfiles() {
-  const res = await pool.query(`
-    SELECT id, rapt_user_id, rapt_api_key FROM rapt.user_profiles
-    WHERE rapt_user_id IS NOT NULL AND rapt_api_key IS NOT NULL
-  `);
+  const res = await pool.query('SELECT * FROM rapt.get_all_rapt_creds_for_sync()');
   return res.rows;
 }
 
@@ -206,7 +209,18 @@ async function insertHydrometerTelemetry(hydrometerId, rows) {
   }
 }
 
+// Allowlist of permitted {table, idColumn} combinations for lastTelemetryTs.
+// pg cannot parameterise SQL identifiers, so we guard them explicitly.
+const TELEMETRY_IDENTIFIER_ALLOWLIST = new Set([
+  'rapt.telemetry_controllers|device_id',
+  'rapt.telemetry_hydrometers|hydrometer_id',
+]);
+
 async function lastTelemetryTs(table, idColumn, deviceId) {
+  const key = `${table}|${idColumn}`;
+  if (!TELEMETRY_IDENTIFIER_ALLOWLIST.has(key)) {
+    throw new Error(`lastTelemetryTs: disallowed identifier combination: ${key}`);
+  }
   const res = await pool.query(
     `SELECT MAX(created_on) AS last FROM ${table} WHERE ${idColumn} = $1`,
     [deviceId]
@@ -326,10 +340,16 @@ async function runSync() {
   syncRunning = true;
   const t0 = Date.now();
   try {
-    const userProfiles = await fetchActiveProfiles();
+    let userProfiles;
+    try {
+      userProfiles = await fetchActiveProfiles();
+    } catch (e) {
+      console.error('[db-sync] fetch creds via RPC failed:', e.message);
+      return;
+    }
     if (userProfiles.length === 0) {
       if (!lastSyncPaused) {
-        console.log('[db-sync] no RAPT creds in rapt.user_profiles — sync paused');
+        console.log('[db-sync] no RAPT creds returned by Service-RPC — sync paused');
         lastSyncPaused = true;
       }
       return;
@@ -358,7 +378,7 @@ async function runSync() {
         totalCtrl += (controllers?.length || 0);
         totalHydro += (hydrometers?.length || 0);
       } catch (e) {
-        console.warn(`[db-sync] user ${up.id} (${up.rapt_user_id}) sync failed:`, e.message);
+        console.warn(`[db-sync] user ${up.owner ?? '(unknown)'} sync failed:`, e.message);
       }
     }
 
