@@ -54,6 +54,7 @@ Valide gegen assistent-Supabase (Auth A). Keine DB-Verbindung, kein db-sync.
 | `/api/proxy-image` | GET | CORS-Proxy für externe Bilder | SSRF-Guard (kein JWT — bestehend) |
 | `/api/shop-search` | POST | Brewing-Shop-Crawler | kein JWT — bestehend, siehe Open-Points |
 | `/api/brewfather/*` | alle | Brewfather-API-Proxy (Rezepte/Batches) | JWT + get_my_brewfather_creds |
+| `/api/sso/rapt-ticket` | POST | SSO-Ticket ausstellen (Phase 5) | JWT (requireAuthenticatedUser) |
 
 ## Endpoints — rapt-Proxy (`PROXY_ROLE=rapt`)
 
@@ -70,6 +71,7 @@ Valide gegen rapt-Supabase (Auth R) + db-rapt (db-sync). Kein OpenAI.
 | `/api/rapt/telemetry/start-override` | GET/POST/PUT/DELETE | Startdatum-Override | JWT (requireRaptCreds) |
 | `/api/cache/telemetry` | GET | Telemetrie-Cache | JWT (requireRaptCreds) |
 | `/api/cache/controllers` | GET | Controller-Cache | JWT (requireRaptCreds) |
+| `/api/sso/redeem` | POST | SSO-Ticket einlösen → rapt-Session (Phase 5) | Ticket-Signatur (kein User-JWT — begründeter Opt-out) |
 
 ## DB-Sync Worker (nur rapt-Proxy)
 
@@ -90,6 +92,10 @@ und UPSERTet in db-rapt (`rapt.controllers`, `rapt.hydrometers`,
 | `RAPT_SYNC_ENABLED` | unbenutzt | `true`/unset |
 | `CORS_ORIGIN` | assistent-Origins | rapt-Origins |
 | `PORT` | 3000 | 3000 (eigener Container) |
+| `SSO_SIGNING_SECRET` | Pflicht (signiert Tickets) | Pflicht (verifiziert Tickets) |
+| `RAPT_SERVICE_ROLE_KEY` | nicht gesetzt | Pflicht (GoTrue-Admin SSO-Redeem) |
+| `SSO_TICKET_TTL_SECS` | optional, Default 60, max 60 | nicht relevant |
+| `SSO_CLOCK_SKEW_SECS` | nicht relevant | optional, Default 5 |
 
 ## Verwandte Repos
 

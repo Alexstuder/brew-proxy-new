@@ -3,6 +3,7 @@ const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
 const dns = require('node:dns/promises');
+const crypto = require('crypto');
 const { searchShops } = require('./services/shopCrawler');
 
 const BASE_PATH = __dirname;
@@ -69,10 +70,35 @@ const IMAGE_FETCH_TIMEOUT_MS  = Number(process.env.IMAGE_FETCH_TIMEOUT_MS  ?? 15
 // Named independently from RAPT so auth latency can be tuned without affecting RAPT calls.
 const AUTH_FETCH_TIMEOUT_MS   = Number(process.env.AUTH_FETCH_TIMEOUT_MS   ?? 15000);
 
+// ---------------------------------------------------------------------------
+// SSO Phase 5 — REST-Ticket-Konfiguration
+// SSO_SIGNING_SECRET: HMAC-HS256-Secret, MUST be set in both proxy roles.
+//   assistent-Proxy signiert Tickets damit; rapt-Proxy verifiziert sie.
+// SSO_TICKET_TTL_SECS: Ticket-Laufzeit (Default 60, hartes Maximum 60).
+// SSO_CLOCK_SKEW_SECS: erlaubter Clock-Skew bei iat-Zukunfts-Prüfung (Default 5).
+// ---------------------------------------------------------------------------
+const SSO_TICKET_TTL_SECS = Math.min(
+  Number(process.env.SSO_TICKET_TTL_SECS ?? 60),
+  60
+);
+const SSO_CLOCK_SKEW_SECS = Number(process.env.SSO_CLOCK_SKEW_SECS ?? 5);
+
 // OPENAI_API_KEY is only required for the assistent role.
 // The rapt proxy does not call OpenAI — crashing for a missing key there would be wrong.
 if (PROXY_ROLE === 'assistent' && !OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY is not set. Provide it via environment variable or proxy/.env file.');
+  process.exit(1);
+}
+
+// SSO_SIGNING_SECRET must be present and at least 32 characters in both roles.
+// A shorter secret weakens HMAC-HS256 to brute-force; abort at startup rather than
+// silently issuing/accepting weak tickets.
+const _ssoSigningSecretAtStartup = process.env.SSO_SIGNING_SECRET;
+if (!_ssoSigningSecretAtStartup || _ssoSigningSecretAtStartup.length < 32) {
+  console.error(
+    '[SSO] SSO_SIGNING_SECRET is missing or too short (minimum 32 characters). ' +
+    'Set a cryptographically random secret before starting.'
+  );
   process.exit(1);
 }
 
@@ -143,6 +169,11 @@ const server = http.createServer(async (req, res) => {
         await handleBrewfatherProxyRequest(req, res, url);
         return;
       }
+      // SSO Phase 5: Ticket-Issue (assistent only — rapt-Proxy hat diese Route NICHT)
+      if (url.pathname === '/api/sso/rapt-ticket' && req.method === 'POST') {
+        await handleSsoTicketRequest(req, res);
+        return;
+      }
     }
 
     if (PROXY_ROLE === 'rapt') {
@@ -176,6 +207,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (url.pathname === '/api/cache/controllers' && req.method === 'GET') {
         await handleControllerCacheResponse(req, res);
+        return;
+      }
+      // SSO Phase 5: Ticket-Redeem (rapt only — assistent-Proxy hat diese Route NICHT)
+      // Auth-Gating: KEIN User-JWT (das Ticket ist der Auth-Beweis; begründeter Opt-out).
+      if (url.pathname === '/api/sso/redeem' && req.method === 'POST') {
+        await handleSsoRedeemRequest(req, res);
         return;
       }
     }
@@ -1155,14 +1192,13 @@ async function requireRaptCreds(req, res) {
 
 /**
  * Middleware-Helper: prüft, ob der JWT-Bearer valide und nicht abgelaufen ist.
- * Wird von OpenAI-Routen (/api/chat, /api/brew, /api/picture) verwendet, die
- * keine per-User-Creds brauchen, aber trotzdem nur authentifizierten Usern
- * offenstehen sollen.
+ * Wird von OpenAI-Routen (/api/chat, /api/brew, /api/picture) und der SSO-Issue-Route
+ * (/api/sso/rapt-ticket) verwendet.
  *
  * Validierung: GET <SUPABASE_URL>/auth/v1/user mit dem User-JWT als Bearer.
  * Supabase Kong prüft Signatur + Ablaufzeit serverseitig — kein service_role-Key nötig.
  * Bei Fehler: schreibt 401 (generisch, kein Secret-Leak) und gibt null zurück.
- * Bei Erfolg: gibt { userId } zurück.
+ * Bei Erfolg: gibt { userId, email } zurück. Bestehende Caller ignorieren `email` einfach.
  */
 async function requireAuthenticatedUser(req, res) {
   const jwt = getJwtFromRequest(req);
@@ -1192,7 +1228,9 @@ async function requireAuthenticatedUser(req, res) {
     }
     const user = await authResp.json().catch(() => null);
     const userId = user?.id || 'unknown';
-    return { userId };
+    // email is needed by the SSO-Issue route; undefined for other callers (harmless).
+    const email = typeof user?.email === 'string' ? user.email : undefined;
+    return { userId, email };
   } catch (err) {
     console.error('[Auth] requireAuthenticatedUser error:', err.message || err);
     respondJson(res, 401, { error: 'Auth check failed.' });
@@ -1269,6 +1307,348 @@ async function handleBrewfatherProxyRequest(req, res, url) {
     }
     respondJson(res, 502, { error: 'Brewfather upstream request failed.' });
   }
+}
+
+// ============================================================================
+// SSO Phase 5 — REST-Ticket-Föderations-Routen
+// ============================================================================
+//
+// Übersicht:
+//   assistent-Rolle: POST /api/sso/rapt-ticket  (handleSsoTicketRequest)
+//     JWT-gated, gibt HMAC-signiertes Kurzzeit-Ticket zurück.
+//   rapt-Rolle:      POST /api/sso/redeem        (handleSsoRedeemRequest)
+//     Kein User-JWT (begründeter Opt-out: Ticket ist der Auth-Beweis).
+//     Verifiziert Ticket, single-use per DB, mintet GoTrue-verwaltete rapt-Session.
+//
+// Kein service_role-Key in der assistent-Rolle, nirgends global zugänglich.
+// RAPT_SERVICE_ROLE_KEY wird ausschließlich lokal in handleSsoRedeemRequest gelesen.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Hilfsfunktionen: kompaktes JWS (header.payload.sig, base64url, HMAC-SHA256)
+// Keine externe Dependency — nur Node-Bordmittel (crypto).
+// ---------------------------------------------------------------------------
+
+/**
+ * Kodiert einen Buffer oder String als base64url (kein Padding, url-safe).
+ */
+function base64url(data) {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  return buf.toString('base64url');
+}
+
+/**
+ * Erstellt ein kompaktes JWS-Token (alg=HS256).
+ * Gibt "<header_b64url>.<payload_b64url>.<sig_b64url>" zurück.
+ * secret muss ein nicht-leerer String sein.
+ */
+function ssoTicketSign(payload, secret) {
+  const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body   = base64url(JSON.stringify(payload));
+  const input  = `${header}.${body}`;
+  const sig    = crypto.createHmac('sha256', secret).update(input).digest();
+  return `${input}.${base64url(sig)}`;
+}
+
+/**
+ * Verifiziert ein kompaktes JWS-Token (HMAC-SHA256, constant-time compare).
+ * Gibt das geparste Payload-Objekt zurück oder null bei Fehler (ungültige
+ * Struktur, Signatur-Mismatch, JSON-Parse-Fehler).
+ * Wirft NIE — alle Fehler → null.
+ */
+function ssoTicketVerify(token, secret) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [header, body, sigGiven] = parts;
+    const input = `${header}.${body}`;
+    const sigExpected = crypto.createHmac('sha256', secret).update(input).digest();
+    const sigGivenBuf = Buffer.from(sigGiven, 'base64url');
+    // Constant-time compare (beide Puffer müssen gleiche Länge haben für timingSafeEqual)
+    if (sigGivenBuf.length !== sigExpected.length) return null;
+    if (!crypto.timingSafeEqual(sigGivenBuf, sigExpected)) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Route 1: POST /api/sso/rapt-ticket  (NUR assistent-Rolle)
+// ---------------------------------------------------------------------------
+// JWT-gated via requireAuthenticatedUser. E-Mail kommt aus /auth/v1/user —
+// NICHT aus dem Request-Body (der User darf seine Mapping-Identität nicht wählen).
+// ---------------------------------------------------------------------------
+
+async function handleSsoTicketRequest(req, res) {
+  // 1. Auth-Gate
+  const authCtx = await requireAuthenticatedUser(req, res);
+  if (!authCtx) return; // Antwort schon gesendet (401)
+
+  // 2. E-Mail aus dem GoTrue-User-Objekt
+  const email = authCtx.email;
+  if (typeof email !== 'string' || email.length === 0) {
+    respondJson(res, 400, { error: 'User has no email address — cannot issue SSO ticket.' });
+    return;
+  }
+
+  // 3. Signing-Secret prüfen
+  const signingSecret = process.env.SSO_SIGNING_SECRET;
+  if (!signingSecret) {
+    console.error('[SSO] SSO_SIGNING_SECRET is not set — cannot issue ticket.');
+    respondJson(res, 500, { error: 'SSO not configured.' });
+    return;
+  }
+
+  // 4. Ticket bauen
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: 'assistent',
+    aud: 'rapt',
+    email: email.toLowerCase(),
+    jti: crypto.randomUUID(),
+    iat: now,
+    exp: now + SSO_TICKET_TTL_SECS,
+  };
+  const ticket = ssoTicketSign(payload, signingSecret);
+
+  // 5. Nur das Ticket zurückgeben — kein User-JWT, keine weiteren Felder
+  respondJson(res, 200, { ticket });
+}
+
+// ---------------------------------------------------------------------------
+// Route 2: POST /api/sso/redeem  (NUR rapt-Rolle)
+// ---------------------------------------------------------------------------
+// Auth-Gating: KEIN User-JWT (begründeter Opt-out — der User hat in rapt noch
+// keine Session; das signierte Ticket ist der Auth-Beweis).
+//
+// service_role-Key wird AUSSCHLIESSLICH hier geladen (lokal, nie global).
+// Blast-Radius: nur GoTrue-Admin-Calls (User find/create + Session-Mint).
+// jti-Consume läuft über pg-Pool (proxy_sync), NICHT über service_role.
+// ---------------------------------------------------------------------------
+
+async function handleSsoRedeemRequest(req, res) {
+  // Config-Prüfung zuerst (vor dem Body-Read, um früh zu scheitern)
+  const signingSecret = process.env.SSO_SIGNING_SECRET;
+  // RAPT_SERVICE_ROLE_KEY: lokal gelesen, nie global exportiert, nie geloggt.
+  const raptServiceRoleKey = process.env.RAPT_SERVICE_ROLE_KEY;
+  const raptAnonKey = process.env.SUPABASE_ANON_KEY; // = RAPT_ANON_KEY im rapt-Proxy
+  if (!signingSecret || !raptServiceRoleKey || !raptAnonKey || !SUPABASE_URL) {
+    console.error('[SSO] Missing required env vars (SSO_SIGNING_SECRET / RAPT_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY / SUPABASE_URL).');
+    respondJson(res, 500, { error: 'SSO not configured.' });
+    return;
+  }
+
+  // Body lesen
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = JSON.parse(raw || '{}');
+  } catch {
+    respondJson(res, 400, { error: 'Invalid JSON body.' });
+    return;
+  }
+
+  const ticketStr = body.ticket;
+  if (typeof ticketStr !== 'string' || ticketStr.length === 0) {
+    respondJson(res, 400, { error: 'Missing ticket.' });
+    return;
+  }
+
+  // ── Schritt 1: Signatur verifizieren (constant-time) ──────────────────────
+  const payload = ssoTicketVerify(ticketStr, signingSecret);
+  if (!payload) {
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+
+  // ── Schritt 2: Claims prüfen ──────────────────────────────────────────────
+  if (payload.aud !== 'rapt' || payload.iss !== 'assistent') {
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+  if (typeof payload.email !== 'string' || payload.email.length === 0) {
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+  if (typeof payload.jti !== 'string' || payload.jti.length === 0) {
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+  if (typeof payload.iat !== 'number' || typeof payload.exp !== 'number') {
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+
+  // ── Schritt 3: Zeitfenster prüfen ────────────────────────────────────────
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp < now) {
+    respondJson(res, 401, { error: 'Ticket expired.' });
+    return;
+  }
+  if (payload.exp - payload.iat > 60) {
+    // Überlanges Ticket (jemand hat TTL manipuliert)
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+  if (payload.iat > now + SSO_CLOCK_SKEW_SECS) {
+    // iat liegt zu weit in der Zukunft (Clock-Skew-Verletzung)
+    respondJson(res, 401, { error: 'Invalid ticket.' });
+    return;
+  }
+
+  // ── Schritt 4: Single-use jti via pg-Pool (proxy_sync, NICHT service_role) ─
+  const pool = dbSync.getPool();
+  if (!pool) {
+    console.error('[SSO] pg pool not available (db-sync not initialized?).');
+    respondJson(res, 503, { error: 'SSO temporarily unavailable.' });
+    return;
+  }
+  let jtiConsumed;
+  try {
+    // p_exp: Unix-Sekunden → timestamp with time zone (PostgreSQL to_timestamp akzeptiert float)
+    const result = await pool.query(
+      'SELECT rapt.consume_sso_jti($1, to_timestamp($2)) AS ok',
+      [payload.jti, payload.exp]
+    );
+    jtiConsumed = result.rows[0]?.ok === true;
+  } catch (err) {
+    console.error('[SSO] consume_sso_jti error:', err.message);
+    respondJson(res, 503, { error: 'SSO temporarily unavailable.' });
+    return;
+  }
+  if (!jtiConsumed) {
+    // Bereits verbraucht → Replay-Angriff oder Doppel-Einlösung
+    respondJson(res, 409, { error: 'Ticket already redeemed.' });
+    return;
+  }
+
+  const email = payload.email; // lowercase-normalisiert vom Issue-Handler
+  const gotruBase = SUPABASE_URL.replace(/\/$/, '');
+
+  // ── Schritt 5: User find-or-create in rapt-Supabase (service_role) ────────
+  try {
+    const createResp = await fetch(`${gotruBase}/auth/v1/admin/users`, {
+      method: 'POST',
+      headers: {
+        apikey: raptServiceRoleKey,
+        Authorization: `Bearer ${raptServiceRoleKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email, email_confirm: true }),
+      signal: AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS),
+    });
+    if (!createResp.ok) {
+      const errBody = await createResp.json().catch(() => ({}));
+      // GoTrue v2 uses `msg`; newer builds may use `message` — accept both.
+      const errMsg = errBody.message || errBody.msg || '';
+      const isEmailExists =
+        createResp.status === 422 &&
+        (errBody.error_code === 'email_exists' ||
+          // Substring fallback for GoTrue builds that omit error_code.
+          // Actual GoTrue v2 text: "…has already been registered"
+          (typeof errMsg === 'string' && errMsg.toLowerCase().includes('already been registered')));
+      if (!isEmailExists) {
+        console.error(`[SSO] GoTrue admin/users failed (${createResp.status}):`, errMsg || '(no msg)');
+        respondJson(res, 502, { error: 'SSO upstream error.' });
+        return;
+      }
+      // 422 email_exists → User existiert bereits → kein Fehler, weiterfahren
+    }
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      respondJson(res, 504, { error: 'SSO upstream timeout.' });
+      return;
+    }
+    console.error('[SSO] GoTrue admin/users network error:', err.message);
+    respondJson(res, 502, { error: 'SSO upstream error.' });
+    return;
+  }
+
+  // ── Schritt 6: Session minten via generate_link → verify ─────────────────
+  // generate_link gibt hashed_token + verification_type zurück.
+  // verification_type ist "signup" für neue User, "magiclink" für bestehende.
+  // Wir nutzen den zurückgelieferten Typ in verify (nicht hardcoded "magiclink").
+  let hashedToken, verificationType;
+  try {
+    const glResp = await fetch(`${gotruBase}/auth/v1/admin/generate_link`, {
+      method: 'POST',
+      headers: {
+        apikey: raptServiceRoleKey,
+        Authorization: `Bearer ${raptServiceRoleKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ type: 'magiclink', email }),
+      signal: AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS),
+    });
+    const glBody = await glResp.json().catch(() => ({}));
+    if (!glResp.ok) {
+      const errMsg = glBody.message || glBody.msg || '(no msg)';
+      console.error(`[SSO] GoTrue generate_link failed (${glResp.status}):`, errMsg);
+      respondJson(res, 502, { error: 'SSO upstream error.' });
+      return;
+    }
+    hashedToken = glBody.hashed_token;
+    verificationType = glBody.verification_type;
+    if (!hashedToken || !verificationType) {
+      console.error('[SSO] generate_link response missing hashed_token or verification_type. Shape:', JSON.stringify(Object.keys(glBody)));
+      respondJson(res, 502, { error: 'SSO upstream error.' });
+      return;
+    }
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      respondJson(res, 504, { error: 'SSO upstream timeout.' });
+      return;
+    }
+    console.error('[SSO] GoTrue generate_link network error:', err.message);
+    respondJson(res, 502, { error: 'SSO upstream error.' });
+    return;
+  }
+
+  // verify — KEIN service_role hier, nur ANON_KEY
+  let session;
+  try {
+    const verifyResp = await fetch(`${gotruBase}/auth/v1/verify`, {
+      method: 'POST',
+      headers: {
+        apikey: raptAnonKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ type: verificationType, token_hash: hashedToken }),
+      signal: AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS),
+    });
+    session = await verifyResp.json().catch(() => null);
+    if (!verifyResp.ok) {
+      const errMsg = (session && (session.message || session.msg)) || '(no msg)';
+      console.error(`[SSO] GoTrue verify failed (${verifyResp.status}):`, errMsg);
+      session = null;
+      respondJson(res, 502, { error: 'SSO upstream error.' });
+      return;
+    }
+    if (!session || !session.access_token || !session.refresh_token) {
+      console.error('[SSO] GoTrue verify response missing access_token/refresh_token.');
+      respondJson(res, 502, { error: 'SSO upstream error.' });
+      return;
+    }
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      respondJson(res, 504, { error: 'SSO upstream timeout.' });
+      return;
+    }
+    console.error('[SSO] GoTrue verify network error:', err.message);
+    respondJson(res, 502, { error: 'SSO upstream error.' });
+    return;
+  }
+
+  // ── Schritt 7: Nur Session-Felder zurückgeben (kein service_role, kein Ticket, kein hashed_token) ─
+  respondJson(res, 200, {
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    expires_at: session.expires_at,
+    token_type: session.token_type,
+  });
 }
 
 function readBody(req) {
