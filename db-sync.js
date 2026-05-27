@@ -13,13 +13,29 @@
 
 const { Pool } = require('pg');
 
+// ---------------------------------------------------------------------------
+// Env helpers — treat empty / whitespace-only strings as "unset" so that
+// docker-compose ${VAR:-} injection (empty string) falls back to in-code
+// defaults rather than silently breaking URL construction or numeric logic.
+// ---------------------------------------------------------------------------
+function envStr(name, def) {
+  const v = process.env[name];
+  return (typeof v === 'string' && v.trim() !== '') ? v : def;
+}
+function envNum(name, def) {
+  const v = process.env[name];
+  if (typeof v !== 'string' || v.trim() === '') return def;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
 const DATABASE_URL = process.env.DATABASE_URL;
-const SYNC_INTERVAL_MS = Number(process.env.RAPT_SYNC_INTERVAL_MS ?? 5 * 60 * 1000);
+const SYNC_INTERVAL_MS      = envNum('RAPT_SYNC_INTERVAL_MS',    5 * 60 * 1000);
 const SYNC_ENABLED = process.env.RAPT_SYNC_ENABLED !== 'false';
 
-const RAPT_TOKEN_ENDPOINT = process.env.RAPT_TOKEN_ENDPOINT ?? 'https://id.rapt.io/connect/token';
-const RAPT_API_BASE = process.env.RAPT_API_BASE ?? 'https://api.rapt.io';
-const RAPT_FETCH_TIMEOUT_MS = Number(process.env.RAPT_FETCH_TIMEOUT_MS ?? 15000);
+const RAPT_TOKEN_ENDPOINT   = envStr('RAPT_TOKEN_ENDPOINT',   'https://id.rapt.io/connect/token');
+const RAPT_API_BASE         = envStr('RAPT_API_BASE',         'https://api.rapt.io');
+const RAPT_FETCH_TIMEOUT_MS = envNum('RAPT_FETCH_TIMEOUT_MS', 15000);
 
 let pool = null;
 // Token-Cache pro owner-UUID (eindeutig im Multi-Tenant-Modell)

@@ -6,6 +6,23 @@ const dns = require('node:dns/promises');
 const crypto = require('crypto');
 const { searchShops } = require('./services/shopCrawler');
 
+// ---------------------------------------------------------------------------
+// Env helpers — treat empty / whitespace-only strings as "unset" so that
+// docker-compose ${VAR:-} injection (empty string) falls back to in-code
+// defaults rather than silently breaking URL construction or numeric logic.
+// Same helpers as in db-sync.js (kept local to avoid a shared-util dependency).
+// ---------------------------------------------------------------------------
+function envStr(name, def) {
+  const v = process.env[name];
+  return (typeof v === 'string' && v.trim() !== '') ? v : def;
+}
+function envNum(name, def) {
+  const v = process.env[name];
+  if (typeof v !== 'string' || v.trim() === '') return def;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
 const BASE_PATH = __dirname;
 const LOCAL_ENV = process.env.PROXY_ENV ?? path.join(BASE_PATH, '.env');
 const CACHE_DIR = path.join(BASE_PATH, 'cache');
@@ -35,25 +52,29 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Innerhalb Docker erreicht der Proxy Supabase über das interne Kong (Container-Name).
 // SUPABASE_PUBLIC_URL ist die Browser-URL (localhost / Cloudflare-Hostname) und wäre
 // vom Container aus nicht auflösbar.
+// envStr() ensures an empty-string injection from ${VAR:-} doesn't win over the next
+// candidate or the final hardcoded default.
 const SUPABASE_URL =
-  process.env.SUPABASE_INTERNAL_URL ??
-  process.env.SUPABASE_PUBLIC_URL ??
-  process.env.SUPABASE_URL ??
+  envStr('SUPABASE_INTERNAL_URL', null) ??
+  envStr('SUPABASE_PUBLIC_URL',   null) ??
+  envStr('SUPABASE_URL',          null) ??
   'http://supabase-kong:8000';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const BREWFATHER_BASE_URL = process.env.BREWFATHER_BASE_URL ?? 'https://api.brewfather.app/v2';
+const BREWFATHER_BASE_URL = envStr('BREWFATHER_BASE_URL', 'https://api.brewfather.app/v2');
 // RAPT_USERNAME/RAPT_API_KEY werden NICHT mehr aus env gelesen.
 // Multi-User-Pattern: jeder User hat eigene RAPT-Creds in aibrewgenius.user_profiles,
 // Proxy holt sie pro Request via Supabase-JWT (siehe requireRaptCreds).
-const RAPT_TOKEN_ENDPOINT = process.env.RAPT_TOKEN_ENDPOINT ?? 'https://id.rapt.io/connect/token';
-const RAPT_API_BASE = process.env.RAPT_API_BASE ?? 'https://api.rapt.io';
-const RAPT_PROFILE_ENDPOINT = process.env.RAPT_PROFILE_ENDPOINT ?? '/api/Profiles/GetProfiles';
-const RAPT_CONTROLLERS_ENDPOINT =
-  process.env.RAPT_CONTROLLER_ENDPOINT ?? '/api/TemperatureControllers/GetTemperatureControllers';
-const RAPT_TELEMETRY_ENDPOINT = process.env.RAPT_TELEMETRY_ENDPOINT ?? '/api/Hydrometers/GetTelemetry';
-const RAPT_CONTROLLER_USE = process.env.RAPT_CONTROLLER_USE ?? 'Beer Fermentation';
-const PORT = Number(process.env.PORT ?? 3000);
-const CACHE_INTERVAL_MS = Number(process.env.RAPT_CACHE_INTERVAL_MS ?? 60 * 60 * 1000);
+const RAPT_TOKEN_ENDPOINT        = envStr('RAPT_TOKEN_ENDPOINT',      'https://id.rapt.io/connect/token');
+const RAPT_API_BASE              = envStr('RAPT_API_BASE',            'https://api.rapt.io');
+const RAPT_PROFILE_ENDPOINT      = envStr('RAPT_PROFILE_ENDPOINT',    '/api/Profiles/GetProfiles');
+const RAPT_CONTROLLERS_ENDPOINT  = envStr('RAPT_CONTROLLER_ENDPOINT', '/api/TemperatureControllers/GetTemperatureControllers');
+const RAPT_TELEMETRY_ENDPOINT    = envStr('RAPT_TELEMETRY_ENDPOINT',  '/api/Hydrometers/GetTelemetry');
+const RAPT_CONTROLLER_USE        = envStr('RAPT_CONTROLLER_USE',      'Beer Fermentation');
+const PORT                       = envNum('PORT',                     3000);
+const CACHE_INTERVAL_MS          = envNum('RAPT_CACHE_INTERVAL_MS',   60 * 60 * 1000);
+// CORS_ORIGIN: intentionally NOT defaulted via envStr — an empty string is a valid
+// operator choice meaning "no fixed origin, fall back to '*' in setCorsHeaders".
+// envStr would silently replace "" with '*', masking the operator intent.
 const ALLOWED_ORIGIN_RAW = process.env.CORS_ORIGIN ?? '*';
 const ALLOWED_ORIGINS = ALLOWED_ORIGIN_RAW.split(',')
   .map(value => value.trim())
@@ -61,14 +82,14 @@ const ALLOWED_ORIGINS = ALLOWED_ORIGIN_RAW.split(',')
 const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.includes('*');
 
 // Outbound fetch timeouts. Override via env; no var is required — these are safe defaults.
-const OPENAI_FETCH_TIMEOUT_MS = Number(process.env.OPENAI_FETCH_TIMEOUT_MS ?? 60000);
-const RAPT_FETCH_TIMEOUT_MS   = Number(process.env.RAPT_FETCH_TIMEOUT_MS   ?? 15000);
-const BF_FETCH_TIMEOUT_MS     = Number(process.env.BF_FETCH_TIMEOUT_MS     ?? 15000);
+const OPENAI_FETCH_TIMEOUT_MS = envNum('OPENAI_FETCH_TIMEOUT_MS', 60000);
+const RAPT_FETCH_TIMEOUT_MS   = envNum('RAPT_FETCH_TIMEOUT_MS',   15000);
+const BF_FETCH_TIMEOUT_MS     = envNum('BF_FETCH_TIMEOUT_MS',     15000);
 // Separate timeout for /api/proxy-image: proxying public image URLs, not RAPT-specific.
-const IMAGE_FETCH_TIMEOUT_MS  = Number(process.env.IMAGE_FETCH_TIMEOUT_MS  ?? 15000);
+const IMAGE_FETCH_TIMEOUT_MS  = envNum('IMAGE_FETCH_TIMEOUT_MS',  15000);
 // Timeout for the Supabase /auth/v1/user call inside requireAuthenticatedUser.
 // Named independently from RAPT so auth latency can be tuned without affecting RAPT calls.
-const AUTH_FETCH_TIMEOUT_MS   = Number(process.env.AUTH_FETCH_TIMEOUT_MS   ?? 15000);
+const AUTH_FETCH_TIMEOUT_MS   = envNum('AUTH_FETCH_TIMEOUT_MS',   15000);
 
 // ---------------------------------------------------------------------------
 // SSO Phase 5 — REST-Ticket-Konfiguration
@@ -77,11 +98,8 @@ const AUTH_FETCH_TIMEOUT_MS   = Number(process.env.AUTH_FETCH_TIMEOUT_MS   ?? 15
 // SSO_TICKET_TTL_SECS: Ticket-Laufzeit (Default 60, hartes Maximum 60).
 // SSO_CLOCK_SKEW_SECS: erlaubter Clock-Skew bei iat-Zukunfts-Prüfung (Default 5).
 // ---------------------------------------------------------------------------
-const SSO_TICKET_TTL_SECS = Math.min(
-  Number(process.env.SSO_TICKET_TTL_SECS ?? 60),
-  60
-);
-const SSO_CLOCK_SKEW_SECS = Number(process.env.SSO_CLOCK_SKEW_SECS ?? 5);
+const SSO_TICKET_TTL_SECS = Math.min(envNum('SSO_TICKET_TTL_SECS', 60), 60);
+const SSO_CLOCK_SKEW_SECS = envNum('SSO_CLOCK_SKEW_SECS', 5);
 
 // OPENAI_API_KEY is only required for the assistent role.
 // The rapt proxy does not call OpenAI — crashing for a missing key there would be wrong.
